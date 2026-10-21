@@ -279,7 +279,7 @@ dependencies = [
 [[package]]
 name = "nddev-device-sync-adapter-io"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-agent?rev=fba131111837ce1fe6c82ce6df9e3d19420f62e7#fba131111837ce1fe6c82ce6df9e3d19420f62e7"
+source = "git+https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-agent?rev=a45a0d980d1e39260dfc7e6d6cbda55b02991d35#a45a0d980d1e39260dfc7e6d6cbda55b02991d35"
 dependencies = [
  "errno",
  "libproc",

@@ -12,7 +12,7 @@ repository = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-
 serde = { version = "1", features = ["derive"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
-nddev-device-sync-adapter-io = { version = "=0.0.1-alpha.4", git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-agent", rev = "fba131111837ce1fe6c82ce6df9e3d19420f62e7" }
+nddev-device-sync-adapter-io = { version = "=0.0.1-alpha.4", git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-agent", rev = "a45a0d980d1e39260dfc7e6d6cbda55b02991d35" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
