@@ -161,18 +161,16 @@ mod tests {
             Cleaner::new(io.clone(), PathBuf::from("rldyour-cleaner")),
             Err(IoError::InvalidConfiguration)
         ));
-        assert!(Cleaner::new(io, PathBuf::from("/usr/bin/rldyour-cleaner")).is_ok());
+        assert!(Cleaner::new(io, std::env::temp_dir().join("rldyour-cleaner")).is_ok());
     }
 
     #[test]
     fn requests_are_bounded_in_time_and_output() {
         let io = NativeIo::new(1).unwrap().process_handle();
-        let cleaner = Cleaner::new(io, PathBuf::from("/usr/bin/rldyour-cleaner")).unwrap();
+        let executable = std::env::temp_dir().join("rldyour-cleaner");
+        let cleaner = Cleaner::new(io, executable.clone()).unwrap();
         let request = cleaner.request(&["doctor", "--json"]);
-        assert_eq!(
-            request.executable,
-            PathBuf::from("/usr/bin/rldyour-cleaner")
-        );
+        assert_eq!(request.executable, executable);
         assert_eq!(request.arguments, ["doctor", "--json"]);
         assert_eq!(request.timeout, Duration::from_secs(30));
         assert_eq!(request.max_output_bytes, 1_048_576);
