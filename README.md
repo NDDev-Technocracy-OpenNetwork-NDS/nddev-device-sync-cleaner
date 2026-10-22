@@ -14,3 +14,5 @@ provider paths used by CI. Acceptance exercises the real pinned native owner
 in isolated temporary state. Linux provider acceptance and portable source
 checks are distinct; an absent provider is unavailable, not a successful stub.
 There is no backup/recovery implementation or private estate configuration.
+
+Release journals live in [GitHub Releases](https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-cleaner/releases).
