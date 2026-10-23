@@ -1,5 +1,5 @@
-use crate::view::*;
-use nddev_device_sync_adapter_io::{CancellationToken, IoError, ProcessIo, ProcessRequest};
+use crate::{Error, IoError, ReadCleaner, view::*};
+use nddev_device_sync_adapter_io::{CancellationToken, ProcessIo, ProcessRequest};
 
 use std::{path::PathBuf, time::Duration};
 
@@ -10,9 +10,9 @@ pub struct Cleaner {
 }
 
 impl Cleaner {
-    pub fn new(io: ProcessIo, executable: PathBuf) -> Result<Self, IoError> {
+    pub fn new(io: ProcessIo, executable: PathBuf) -> Result<Self, Error> {
         if !executable.is_absolute() {
-            return Err(IoError::InvalidConfiguration);
+            return Err(IoError::InvalidConfiguration.into());
         }
         Ok(Self { io, executable })
     }
@@ -27,44 +27,40 @@ impl Cleaner {
         }
     }
 
-    pub async fn diagnose(&self, cancellation: CancellationToken) -> Result<Diagnostics, IoError> {
-        let (report, exit): (Diagnostics, _) = self
-            .io
-            .json(self.request(&["doctor", "--json"]), &[0, 1], cancellation)
-            .await?;
-        if !valid_owner(&report.tool, &report.version) || !consistent(&report, exit) {
-            return Err(IoError::InvalidResponse);
-        }
-        Ok(report)
-    }
-
-    pub async fn preview(
-        &self,
-        cancellation: CancellationToken,
-    ) -> Result<CleanerRunSummary, IoError> {
-        self.report(&["run", "--dry-run", "--json"], true, cancellation)
-            .await
-    }
-
-    pub async fn last_run(
-        &self,
-        cancellation: CancellationToken,
-    ) -> Result<CleanerRunSummary, IoError> {
-        self.report(&["status"], false, cancellation).await
-    }
-
     async fn report(
         &self,
         args: &[&str],
         preview: bool,
         cancellation: CancellationToken,
-    ) -> Result<CleanerRunSummary, IoError> {
+    ) -> Result<CleanerRunSummary, Error> {
         let (report, _): (CleanerRunSummary, _) =
             self.io.json(self.request(args), &[0], cancellation).await?;
         if !valid_owner(&report.tool, &report.version) || report.dry_run != preview {
-            return Err(IoError::InvalidResponse);
+            return Err(Error::Protocol);
         }
         Ok(report)
+    }
+}
+
+impl ReadCleaner for Cleaner {
+    async fn diagnose(&self, cancellation: CancellationToken) -> Result<Diagnostics, Error> {
+        let (report, exit): (Diagnostics, _) = self
+            .io
+            .json(self.request(&["doctor", "--json"]), &[0, 1], cancellation)
+            .await?;
+        if !valid_owner(&report.tool, &report.version) || !consistent(&report, exit) {
+            return Err(Error::Protocol);
+        }
+        Ok(report)
+    }
+
+    async fn preview(&self, cancellation: CancellationToken) -> Result<CleanerRunSummary, Error> {
+        self.report(&["run", "--dry-run", "--json"], true, cancellation)
+            .await
+    }
+
+    async fn last_run(&self, cancellation: CancellationToken) -> Result<CleanerRunSummary, Error> {
+        self.report(&["status"], false, cancellation).await
     }
 }
 
@@ -159,7 +155,7 @@ mod tests {
         let io = NativeIo::new(1).unwrap().process_handle();
         assert!(matches!(
             Cleaner::new(io.clone(), PathBuf::from("rldyour-cleaner")),
-            Err(IoError::InvalidConfiguration)
+            Err(Error::Io(IoError::InvalidConfiguration))
         ));
         assert!(Cleaner::new(io, std::env::temp_dir().join("rldyour-cleaner")).is_ok());
     }
