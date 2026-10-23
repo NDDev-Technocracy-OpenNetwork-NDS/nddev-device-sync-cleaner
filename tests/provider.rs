@@ -1,5 +1,5 @@
 use nddev_device_sync_adapter_io::{CancellationToken, NativeIo};
-use nddev_device_sync_cleaner::Cleaner;
+use nddev_device_sync_cleaner::{Cleaner, ReadCleaner};
 
 #[tokio::test]
 #[ignore = "requires NDS_TEST_CLEANER pointing to the real installed cleaner"]
