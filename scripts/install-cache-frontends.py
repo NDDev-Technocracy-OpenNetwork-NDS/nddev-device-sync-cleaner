@@ -22,9 +22,19 @@ def install(config_path, binary):
         raise ValueError("refuse to adopt an unrelated frontend directory")
     commands = {"cargo": ["cargo"], "uv": ["uv"], "uvx": ["uv", "tool", "run"],
                 "bun": ["bun"], "bunx": ["bun", "x"]}
-    for name, operation in commands.items():
+    contents = {name: "#!/bin/sh\n" + MARKER + "exec " + shlex.join([str(binary), str(config_path), *operation]) + ' "$@"\n'
+                for name, operation in commands.items()}
+    if config.get("rustup"):
+        native = Path(config["rustup"]).resolve(strict=True)
+        if not native.is_absolute() or native == root / "rustup":
+            raise ValueError("rustup backend must be a separate native executable")
+        contents["rustup"] = ("#!/bin/sh\n" + MARKER
+            + 'if [ "$#" -ge 3 ] && [ "$1" = run ] && [ "$3" = cargo ]; then\n'
+            + '  nds_cache_channel=$2\n  shift 3\n  exec '
+            + shlex.join([str(binary), str(config_path), "cargo"])
+            + ' "+$nds_cache_channel" "$@"\nfi\nexec ' + shlex.quote(str(native)) + ' "$@"\n')
+    for name, content in contents.items():
         target = root / name
-        content = "#!/bin/sh\n" + MARKER + "exec " + shlex.join([str(binary), str(config_path), *operation]) + ' "$@"\n'
         if target.exists() and (target.is_symlink() or not target.read_text().startswith("#!/bin/sh\n" + MARKER)):
             raise ValueError("refuse to replace an unrelated frontend")
         if target.exists() and target.read_text() == content:
@@ -35,7 +45,7 @@ def install(config_path, binary):
         pending.chmod(0o755)
         pending.replace(target)
     (root / ".nds-cache-frontends").write_text("1\n")
-    return {"installed": sorted(commands)}
+    return {"installed": sorted(contents)}
 
 
 if __name__ == "__main__":

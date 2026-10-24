@@ -50,7 +50,10 @@ requires an empty directory and creates an ownership marker. Existing caches are
 not silently adopted. Provider binary paths come from the verified installation;
 `frontends` selects a dedicated local tool prefix. Generate its argv-preserving
 Cargo/uv/Bun wrappers with `scripts/install-cache-frontends.py CONFIG BINARY`;
-the prefix refuses unrelated existing files.
+the prefix refuses unrelated existing files. When a native Rustup backend is
+configured, its `run TOOLCHAIN cargo ...` invocation also enters Cleaner with
+that compiler selection. Other Rustup operations delegate unchanged to the
+native backend. This covers SDK helpers that invoke Rustup directly.
 
 ```sh
 nds-cleaner-cache /operator/config/cache.json init
