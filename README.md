@@ -10,9 +10,13 @@ and macOS arm64. Installations and configuration stay outside the source checkou
 Managed Cargo intermediates are shared across projects, separated by complete
 compiler identity and host. Final artifacts have separate workspace directories.
 The wrapper selects each project's Rustup compiler, including `cargo +toolchain`;
-its Cargo frontend uses the qualified nightly `mtime-on-use` feature. NDS builds
+its Cargo frontend uses qualified nightly use tracking and fine-grained locks. NDS builds
 retain their pinned stable compiler. A fixed compiler installation rejects a
-conflicting project toolchain file. Existing project lockfiles keep their owner.
+conflicting project toolchain file. Caller-selected compilers, prepared Cargo
+homes and final/intermediate staging paths are honored. Invocation-local cache
+configuration and nested wrapper scopes avoid inheriting a parent final-output
+lock into build-script Cargo calls. Explicit staging outside managed roots stays
+with its caller. Existing project lockfiles keep their owner.
 
 Cleanup retains active shared leases, including native children surviving Cargo's
 exit. An exclusive lease permits removal only of known native unit groups whose
@@ -44,7 +48,9 @@ Supply a private JSON file with `schema: 1`, absolute `root`, `cargo`, `rustc`,
 `bun` paths. The root must be canonical, user-owned and mode 0700. Initialization
 requires an empty directory and creates an ownership marker. Existing caches are
 not silently adopted. Provider binary paths come from the verified installation;
-`frontends` may select an operator-installed directory of local tool shims.
+`frontends` selects a dedicated local tool prefix. Generate its argv-preserving
+Cargo/uv/Bun wrappers with `scripts/install-cache-frontends.py CONFIG BINARY`;
+the prefix refuses unrelated existing files.
 
 ```sh
 nds-cleaner-cache /operator/config/cache.json init

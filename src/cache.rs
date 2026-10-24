@@ -146,6 +146,19 @@ fn hash_name(name: &str, length: usize) -> bool {
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
+fn executable(value: OsString, cwd: &Path) -> Result<PathBuf> {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    if path.components().count() > 1 {
+        return Ok(cwd.join(path));
+    }
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join(&path))
+        .find(|path| path.is_file())
+        .ok_or(CacheError::Provider)
+}
 fn directory(dir: &Dir, path: &Path) -> Result<Dir> {
     let metadata = dir.symlink_metadata(path)?;
     if !metadata.is_dir() || metadata.is_symlink() {
@@ -413,6 +426,41 @@ impl ManagedCache {
         }
         Ok(path)
     }
+    // Caller-owned staging is preserved. Recognized paths inside our own pool
+    // additionally retain their actual lane lease and completed-use record.
+    fn retain_managed_path(&self, path: &Path, kind: &str) -> Result<Option<fs::File>> {
+        let prefix = self.config.root.join("cargo/lanes");
+        let Ok(relative) = path.strip_prefix(prefix) else {
+            return Ok(None);
+        };
+        let parts: Vec<_> = relative.components().map(|part| part.as_os_str()).collect();
+        if parts.len() < 2
+            || !parts[0].to_str().is_some_and(|s| hash_name(s, 64))
+            || parts[1] != kind
+        {
+            return Err(CacheError::Ownership);
+        }
+        if relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(CacheError::Ownership);
+        }
+        let lane = prepare(&self.root, &Path::new("cargo/lanes").join(parts[0]))?;
+        let guard = lease(&lane, false, true)?;
+        if kind == "targets" {
+            if parts.len() != 4
+                || parts[3] != "cache"
+                || !parts[2].to_str().is_some_and(|s| hash_name(s, 64))
+            {
+                return Err(CacheError::Ownership);
+            }
+            let target = prepare(&lane, &Path::new("targets").join(parts[2]))?;
+            use_cache(&target)?;
+            target.create_dir_all("cache")?;
+        }
+        Ok(Some(guard))
+    }
     fn command(
         &self,
         executable: &Path,
@@ -446,7 +494,18 @@ impl ManagedCache {
         }
         self.version(&self.config.cargo, &qualified("cargo")?)?;
         let cwd = fs::canonicalize(std::env::current_dir()?)?;
-        let (rustc, rustdoc) = if let Some(rustup) = &self.config.rustup {
+        let provided_compiler = std::env::var_os("RUSTC");
+        let (rustc, rustdoc) = if let Some(compiler) = provided_compiler.as_ref() {
+            let rustc = executable(compiler.clone(), &cwd)?;
+            let rustdoc = if let Some(value) = std::env::var_os("RUSTDOC") {
+                executable(value, &cwd)?
+            } else if rustc.with_file_name("rustdoc").is_file() {
+                rustc.with_file_name("rustdoc")
+            } else {
+                self.config.rustdoc.clone()
+            };
+            (rustc, rustdoc)
+        } else if let Some(rustup) = &self.config.rustup {
             let resolve = |tool: &str| -> Result<PathBuf> {
                 let mut arguments = Vec::new();
                 if let Some(home) = &self.config.rustup_home {
@@ -488,7 +547,7 @@ impl ManagedCache {
         let release = field("release: ")?;
         let host = field("host: ")?;
         field("commit-hash: ")?;
-        if self.config.rustup.is_none() {
+        if self.config.rustup.is_none() && provided_compiler.is_none() {
             fallback_toolchain(&cwd, release, host)?;
             if selected.as_ref().is_some_and(|channel| {
                 channel != release
@@ -504,14 +563,75 @@ impl ManagedCache {
         let lane_path = Path::new("cargo/lanes").join(&lane_name);
         let lane = prepare(&self.root, &lane_path)?;
         let _lease = lease(&lane, false, true)?;
-        let workspace = digest(cwd.as_os_str().as_encoded_bytes());
-        let target_path = lane_path.join("targets").join(workspace);
+        let inherited_build = std::env::var_os("CARGO_BUILD_BUILD_DIR");
+        let inherited_target = std::env::var_os("CARGO_TARGET_DIR")
+            .or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR"));
+        let parent_build = std::env::var_os("NDS_CLEANER_MANAGED_BUILD_DIR");
+        let nested = parent_build.is_some()
+            && (inherited_build.is_none() || inherited_build == parent_build);
+        let depth = if nested {
+            std::env::var("NDS_CLEANER_NESTING")
+                .unwrap_or_else(|_| "0".into())
+                .parse::<u8>()
+                .map_err(|_| CacheError::Configuration)?
+                .checked_add(1)
+                .ok_or(CacheError::Configuration)?
+        } else {
+            0
+        };
+        if depth > 8 {
+            return Err(CacheError::Configuration);
+        }
+        let mut workspace_identity = cwd.as_os_str().as_encoded_bytes().to_vec();
+        for (index, argument) in args.iter().enumerate() {
+            if argument == "--manifest-path" {
+                if let Some(value) = args.get(index + 1) {
+                    workspace_identity.push(0);
+                    workspace_identity.extend(value.as_encoded_bytes());
+                }
+            } else if argument
+                .to_str()
+                .is_some_and(|value| value.starts_with("--manifest-path="))
+            {
+                workspace_identity.push(0);
+                workspace_identity.extend(argument.as_encoded_bytes());
+            }
+        }
+        workspace_identity.push(depth);
+        let workspace = digest(&workspace_identity);
+        let target_path = lane_path.join("targets").join(&workspace);
         let target = prepare(&self.root, &target_path)?;
         use_cache(&target)?;
         directory(&self.root, Path::new("cargo/home"))?;
         lane.create_dir_all("build")?;
         target.create_dir_all("cache")?;
         let root = &self.config.root;
+        let managed_build = if depth == 0 {
+            root.join(&lane_path).join("build")
+        } else {
+            root.join(&lane_path)
+                .join("build/nested")
+                .join(depth.to_string())
+                .join(&workspace)
+        };
+        let managed_target = root.join(&target_path).join("cache");
+        let default_build = nested || inherited_build.is_none();
+        let default_target = inherited_target.is_none()
+            || (nested && inherited_target == std::env::var_os("NDS_CLEANER_MANAGED_TARGET_DIR"));
+        let actual_build = if default_build {
+            managed_build.as_os_str().to_owned()
+        } else {
+            inherited_build.unwrap_or_else(|| managed_build.as_os_str().to_owned())
+        };
+        let actual_target = if default_target {
+            managed_target.as_os_str().to_owned()
+        } else {
+            inherited_target.unwrap_or_else(|| managed_target.as_os_str().to_owned())
+        };
+        let _build_lease = self.retain_managed_path(Path::new(&actual_build), "build")?;
+        let _target_lease = self.retain_managed_path(Path::new(&actual_target), "targets")?;
+        let source_home =
+            std::env::var_os("CARGO_HOME").unwrap_or(self.cargo_home()?.into_os_string());
         let compiler_bin = rustc.parent().ok_or(CacheError::Provider)?;
         let path = std::env::join_paths(
             self.config
@@ -524,33 +644,76 @@ impl ManagedCache {
                 )),
         )
         .map_err(|_| CacheError::Configuration)?;
+        let frontend = self
+            .config
+            .frontends
+            .as_ref()
+            .map(|path| path.join("cargo"));
+        if frontend.as_ref().is_some_and(|path| !path.is_file()) {
+            return Err(CacheError::Configuration);
+        }
         let mut env = vec![
-            ("CARGO_HOME".into(), self.cargo_home()?.into_os_string()),
+            ("CARGO_HOME".into(), source_home),
             (
-                "CARGO_TARGET_DIR".into(),
-                root.join(&target_path).join("cache").into_os_string(),
+                "NDS_CLEANER_MANAGED_BUILD_DIR".into(),
+                managed_build.into_os_string(),
             ),
             (
-                "CARGO_BUILD_BUILD_DIR".into(),
-                root.join(&lane_path).join("build").into_os_string(),
+                "NDS_CLEANER_MANAGED_TARGET_DIR".into(),
+                managed_target.into_os_string(),
             ),
+            ("NDS_CLEANER_NESTING".into(), depth.to_string().into()),
+            ("CARGO_UNSTABLE_MTIME_ON_USE".into(), "true".into()),
+            ("CARGO_UNSTABLE_FINE_GRAIN_LOCKING".into(), "true".into()),
             ("RUSTC".into(), rustc.into_os_string()),
             ("RUSTDOC".into(), rustdoc.into_os_string()),
             ("PATH".into(), path),
         ];
+        if let Some(frontend) = frontend {
+            env.push(("CARGO".into(), frontend.into_os_string()));
+        }
         if let Some(channel) = selected {
             env.push(("RUSTUP_TOOLCHAIN".into(), channel));
         }
         if let Some(home) = &self.config.rustup_home {
             env.push(("RUSTUP_HOME".into(), home.as_os_str().to_owned()));
         }
-        let mut native_args = vec!["-Zmtime-on-use".into(), "-Zgc".into()];
+        let mut native_args = vec![
+            "-Zmtime-on-use".into(),
+            "-Zgc".into(),
+            "-Zfine-grain-locking".into(),
+        ];
+        // Invocation-local configuration avoids propagating generated final-
+        // output locks to native Cargo invoked directly by build scripts.
+        for (default, key, path) in [
+            (default_build, "build.build-dir", &actual_build),
+            (default_target, "build.target-dir", &actual_target),
+        ] {
+            if default {
+                native_args.push("--config".into());
+                let path = path.to_str().ok_or(CacheError::Configuration)?;
+                native_args.push(
+                    format!(
+                        "{key}={}",
+                        serde_json::to_string(path).map_err(|_| CacheError::Configuration)?
+                    )
+                    .into(),
+                );
+            }
+        }
         native_args.extend_from_slice(args);
-        Err(self
-            .command(&self.config.cargo, env, &native_args)
-            .exec()
-            .into())
+        let mut command = self.command(&self.config.cargo, env, &native_args);
+        if default_build {
+            command.env_remove("CARGO_BUILD_BUILD_DIR");
+        }
+        if default_target {
+            command
+                .env_remove("CARGO_TARGET_DIR")
+                .env_remove("CARGO_BUILD_TARGET_DIR");
+        }
+        Err(command.exec().into())
     }
+
     pub fn run_tool(&self, tool: &str, args: &[OsString]) -> Result<()> {
         let (executable, variable, lock) = match tool {
             "uv" => (self.config.uv.as_ref(), "UV_CACHE_DIR", "uv.lock"),
@@ -730,7 +893,7 @@ fn artifact_units(
                     }
                 }
             }
-        } else if depth < 4 && !name_str.starts_with('.') {
+        } else if depth < 8 && !name_str.starts_with('.') {
             artifact_units(&child, depth + 1, current, apply, report, budget)?;
         }
     }
