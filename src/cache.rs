@@ -1,0 +1,1133 @@
+//! Opt-in local development caches. This is not an agent/remote mutation port.
+//! Cargo owns source GC; uv and Bun own deletion inside their idle cache shards.
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions},
+};
+use nddev_device_sync_adapter_io::{CancellationToken, NativeIo, ProcessRequest};
+use rustix::{fs::FlockOperation, io::FdFlags};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    ffi::OsString,
+    fs,
+    io::{self, Read, Write},
+    os::unix::{
+        fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+        process::CommandExt,
+    },
+    path::{Path, PathBuf},
+    process::Command,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+pub const RETENTION: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+const MARKER: &[u8] = b"NDS managed rebuildable cache v1\n";
+fn qualified(name: &str) -> Result<String> {
+    let lock: serde_json::Value =
+        serde_json::from_str(include_str!("../cache-providers.lock.json"))
+            .map_err(|_| CacheError::Configuration)?;
+    let os = if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        std::env::consts::OS
+    };
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        std::env::consts::ARCH
+    };
+    let platform = format!("{os}-{arch}");
+    if !lock["platforms"][&platform].is_object() {
+        return Err(CacheError::Provider);
+    }
+    lock["platforms"][&platform][name]["version_report"]
+        .as_str()
+        .or_else(|| lock["versions"][name].as_str())
+        .map(str::to_owned)
+        .ok_or(CacheError::Configuration)
+}
+const MAX_ENTRIES: usize = 100_000;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    pub schema: u8,
+    pub root: PathBuf,
+    pub cargo: PathBuf,
+    pub rustc: PathBuf,
+    pub rustdoc: PathBuf,
+    pub rustup: Option<PathBuf>,
+    pub rustup_home: Option<PathBuf>,
+    pub frontends: Option<PathBuf>,
+    pub cargo_home: Option<PathBuf>,
+    pub uv: Option<PathBuf>,
+    pub bun: Option<PathBuf>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CacheError {
+    #[error("managed cache configuration is invalid")]
+    Configuration,
+    #[error("cache is not owned, private or initialized")]
+    Ownership,
+    #[error("cache operation is busy; active work is preserved")]
+    Busy,
+    #[error("cache traversal budget is exhausted")]
+    Budget,
+    #[error("cache provider is unavailable or differs from its qualified version")]
+    Provider,
+    #[error("cache filesystem operation failed")]
+    Io,
+}
+impl From<io::Error> for CacheError {
+    fn from(_: io::Error) -> Self {
+        Self::Io
+    }
+}
+impl From<rustix::io::Errno> for CacheError {
+    fn from(_: rustix::io::Errno) -> Self {
+        Self::Io
+    }
+}
+type Result<T> = std::result::Result<T, CacheError>;
+
+pub fn read_config(path: &Path) -> Result<Config> {
+    let file = fs::File::open(path)?;
+    if !file.metadata()?.is_file() || file.metadata()?.len() > 16_384 {
+        return Err(CacheError::Configuration);
+    }
+    let mut bytes = Vec::new();
+    file.take(16_385).read_to_end(&mut bytes)?;
+    let config: Config = serde_json::from_slice(&bytes).map_err(|_| CacheError::Configuration)?;
+    if config.schema != 1
+        || !config.root.is_absolute()
+        || config.root.parent().is_none()
+        || [&config.cargo, &config.rustc, &config.rustdoc]
+            .into_iter()
+            .chain(config.rustup.iter())
+            .chain(config.rustup_home.iter())
+            .chain(config.frontends.iter())
+            .chain(config.cargo_home.iter())
+            .chain(config.uv.iter())
+            .chain(config.bun.iter())
+            .any(|p| !p.is_absolute())
+    {
+        return Err(CacheError::Configuration);
+    }
+    Ok(config)
+}
+
+pub struct ManagedCache {
+    config: Config,
+    root: Dir,
+}
+
+fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+fn now() -> Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| CacheError::Configuration)
+}
+fn expired(last: u64, current: u64) -> bool {
+    current
+        .checked_sub(last)
+        .is_some_and(|age| age > RETENTION.as_secs())
+}
+fn hash_name(name: &str, length: usize) -> bool {
+    name.len() == length
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+fn directory(dir: &Dir, path: &Path) -> Result<Dir> {
+    let metadata = dir.symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.is_symlink() {
+        return Err(CacheError::Ownership);
+    }
+    Ok(dir.open_dir(path)?)
+}
+fn regular(dir: &Dir, path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let meta = dir.symlink_metadata(path)?;
+    if !meta.is_file() || meta.is_symlink() || meta.len() > limit as u64 {
+        return Err(CacheError::Ownership);
+    }
+    let mut bytes = Vec::new();
+    dir.open(path)?
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(CacheError::Ownership);
+    }
+    Ok(bytes)
+}
+fn lease(dir: &Dir, exclusive: bool, inherit: bool) -> Result<fs::File> {
+    let metadata = dir.symlink_metadata(".lease")?;
+    if !metadata.is_file() || metadata.is_symlink() {
+        return Err(CacheError::Ownership);
+    }
+    let file = dir
+        .open_with(".lease", OpenOptions::new().read(true).write(true))?
+        .into_std();
+    rustix::fs::flock(
+        &file,
+        if exclusive {
+            FlockOperation::NonBlockingLockExclusive
+        } else {
+            FlockOperation::LockShared
+        },
+    )
+    .map_err(|error| {
+        if error == rustix::io::Errno::WOULDBLOCK {
+            CacheError::Busy
+        } else {
+            CacheError::Io
+        }
+    })?;
+    if inherit {
+        rustix::io::fcntl_setfd(&file, FdFlags::empty())?;
+    }
+    Ok(file)
+}
+fn initialize_directory(dir: &Dir) -> Result<()> {
+    match dir.open_with(".lease", OpenOptions::new().write(true).create_new(true)) {
+        Ok(file) => {
+            file.set_permissions(cap_std::fs::Permissions::from_std(
+                fs::Permissions::from_mode(0o600),
+            ))?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+fn use_cache(dir: &Dir) -> Result<()> {
+    let current = now()?;
+    let temporary = format!(
+        ".use-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| CacheError::Configuration)?
+            .as_nanos()
+    );
+    let mut file = dir.open_with(&temporary, OpenOptions::new().write(true).create_new(true))?;
+    file.write_all(current.to_string().as_bytes())?;
+    file.sync_all()?;
+    dir.rename(&temporary, dir, ".last-use")?;
+    dir.write(".pending-use", b"1")?;
+    Ok(())
+}
+// The native owner replaces the wrapper and may run for days. A completed-use
+// marker is acknowledged only after an exclusive lease proves it has finished.
+// This conservatively starts idle-shard age at the first maintenance observation.
+fn completed_use(dir: &Dir, current: u64, apply: bool) -> Result<bool> {
+    match dir.symlink_metadata(".pending-use") {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+        Ok(_) => {
+            if regular(dir, Path::new(".pending-use"), 1)? != b"1" {
+                return Err(CacheError::Ownership);
+            }
+            if apply {
+                let temporary = format!(
+                    ".completed-{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|_| CacheError::Configuration)?
+                        .as_nanos()
+                );
+                let mut file =
+                    dir.open_with(&temporary, OpenOptions::new().write(true).create_new(true))?;
+                file.write_all(current.max(last_use(dir)?).to_string().as_bytes())?;
+                file.sync_all()?;
+                dir.rename(&temporary, dir, ".last-use")?;
+                dir.remove_file(".pending-use")?;
+            }
+            Ok(true)
+        }
+    }
+}
+fn last_use(dir: &Dir) -> Result<u64> {
+    String::from_utf8(regular(dir, Path::new(".last-use"), 32)?)
+        .map_err(|_| CacheError::Ownership)?
+        .parse()
+        .map_err(|_| CacheError::Ownership)
+}
+fn prepare(dir: &Dir, path: &Path) -> Result<Dir> {
+    dir.create_dir_all(path)?;
+    let child = directory(dir, path)?;
+    initialize_directory(&child)?;
+    Ok(child)
+}
+
+fn fallback_toolchain(cwd: &Path, release: &str, host: &str) -> Result<()> {
+    for parent in cwd.ancestors() {
+        for (name, is_toml) in [("rust-toolchain.toml", true), ("rust-toolchain", false)] {
+            let path = parent.join(name);
+            if !path.exists() {
+                continue;
+            }
+            let file = fs::File::open(path)?;
+            if !file.metadata()?.is_file() || file.metadata()?.len() > 16_384 {
+                return Err(CacheError::Configuration);
+            }
+            let mut value = String::new();
+            file.take(16_385).read_to_string(&mut value)?;
+            let channel = if is_toml {
+                let parsed: toml::Value =
+                    toml::from_str(&value).map_err(|_| CacheError::Configuration)?;
+                parsed
+                    .get("toolchain")
+                    .and_then(|v| v.get("channel"))
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or(CacheError::Configuration)?
+            } else {
+                value.trim().to_owned()
+            };
+            if channel == release
+                || channel == format!("{release}-{host}")
+                || (channel == "stable" && !release.contains('-'))
+            {
+                return Ok(());
+            }
+            return Err(CacheError::Configuration);
+        }
+    }
+    Ok(())
+}
+
+impl ManagedCache {
+    pub fn initialize(config: Config) -> Result<Self> {
+        if !config.root.exists() {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&config.root)?;
+        }
+        let metadata = fs::symlink_metadata(&config.root)?;
+        if !metadata.is_dir()
+            || metadata.is_symlink()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o077 != 0
+            || fs::canonicalize(&config.root)? != config.root
+        {
+            return Err(CacheError::Ownership);
+        }
+        let dir = Dir::open_ambient_dir(&config.root, ambient_authority())?;
+        if dir.entries()?.next().is_some() {
+            return Err(CacheError::Ownership);
+        }
+        let mut marker = dir.open_with(
+            ".nds-cache",
+            OpenOptions::new().write(true).create_new(true),
+        )?;
+        marker.write_all(MARKER)?;
+        marker.sync_all()?;
+        initialize_directory(&dir)?;
+        dir.create_dir_all("cargo/home")?;
+        dir.set_permissions(
+            "cargo/home",
+            cap_std::fs::Permissions::from_std(fs::Permissions::from_mode(0o700)),
+        )?;
+        dir.create_dir_all("cargo/lanes")?;
+        for tool in ["uv", "bun"] {
+            dir.create_dir(tool)?;
+        }
+        Self::open(config)
+    }
+    pub fn open(config: Config) -> Result<Self> {
+        let meta = fs::symlink_metadata(&config.root)?;
+        if !meta.is_dir()
+            || meta.is_symlink()
+            || meta.uid() != rustix::process::geteuid().as_raw()
+            || meta.mode() & 0o077 != 0
+            || fs::canonicalize(&config.root)? != config.root
+        {
+            return Err(CacheError::Ownership);
+        }
+        let root = Dir::open_ambient_dir(&config.root, ambient_authority())?;
+        if regular(&root, Path::new(".nds-cache"), MARKER.len())? != MARKER {
+            return Err(CacheError::Ownership);
+        }
+        Ok(Self { config, root })
+    }
+    fn native(
+        &self,
+        executable: &Path,
+        arguments: Vec<OsString>,
+        cwd: Option<PathBuf>,
+    ) -> Result<Vec<u8>> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| CacheError::Provider)?;
+        let io = NativeIo::new(1)
+            .map_err(|_| CacheError::Provider)?
+            .process_handle();
+        let output = rt
+            .block_on(io.process(
+                ProcessRequest {
+                    executable: executable.to_owned(),
+                    arguments,
+                    directory: cwd,
+                    timeout: Duration::from_secs(30),
+                    max_output_bytes: 1_048_576,
+                },
+                CancellationToken::new(),
+            ))
+            .map_err(|_| CacheError::Provider)?;
+        if !output.status.success() {
+            return Err(CacheError::Provider);
+        }
+        Ok(output.stdout)
+    }
+    fn version(&self, executable: &Path, expected: &str) -> Result<()> {
+        let bytes = self.native(executable, vec!["--version".into()], None)?;
+        if String::from_utf8_lossy(&bytes).trim() != expected {
+            return Err(CacheError::Provider);
+        }
+        Ok(())
+    }
+    fn cargo_home(&self) -> Result<PathBuf> {
+        let path = self
+            .config
+            .cargo_home
+            .clone()
+            .unwrap_or_else(|| self.config.root.join("cargo/home"));
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_dir()
+            || metadata.is_symlink()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o002 != 0
+        {
+            return Err(CacheError::Ownership);
+        }
+        Ok(path)
+    }
+    fn command(
+        &self,
+        executable: &Path,
+        environment: Vec<(String, OsString)>,
+        args: &[OsString],
+    ) -> Command {
+        let mut command = Command::new(executable);
+        command.args(args);
+        for (key, value) in environment {
+            command.env(key, value);
+        }
+        command
+    }
+    /// Replace the foreground wrapper with its native owner. The shared lease
+    /// has CLOEXEC cleared, so native children retain it even if Cargo is killed.
+    pub fn run_cargo(&self, args: &[OsString]) -> Result<()> {
+        let explicit = args
+            .first()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix('+'));
+        let selected = explicit
+            .map(OsString::from)
+            .or_else(|| std::env::var_os("RUSTUP_TOOLCHAIN"));
+        let args = if explicit.is_some() { &args[1..] } else { args };
+        if args
+            .iter()
+            .take_while(|s| s.as_os_str() != "--")
+            .any(|s| s == "clean")
+        {
+            return Err(CacheError::Configuration);
+        }
+        self.version(&self.config.cargo, &qualified("cargo")?)?;
+        let cwd = fs::canonicalize(std::env::current_dir()?)?;
+        let (rustc, rustdoc) = if let Some(rustup) = &self.config.rustup {
+            let resolve = |tool: &str| -> Result<PathBuf> {
+                let mut arguments = Vec::new();
+                if let Some(home) = &self.config.rustup_home {
+                    let mut variable = OsString::from("RUSTUP_HOME=");
+                    variable.push(home);
+                    arguments.push(variable);
+                }
+                arguments.extend([rustup.as_os_str().to_owned(), "which".into()]);
+                if let Some(channel) = &selected {
+                    if channel.is_empty() || channel.len() > 256 {
+                        return Err(CacheError::Configuration);
+                    }
+                    arguments.extend(["--toolchain".into(), channel.clone()]);
+                }
+                arguments.push(tool.into());
+                let value = self.native(Path::new("/usr/bin/env"), arguments, Some(cwd.clone()))?;
+                let path = PathBuf::from(
+                    String::from_utf8(value)
+                        .map_err(|_| CacheError::Provider)?
+                        .trim(),
+                );
+                if !path.is_absolute() {
+                    return Err(CacheError::Provider);
+                }
+                Ok(path)
+            };
+            (resolve("rustc")?, resolve("rustdoc")?)
+        } else {
+            (self.config.rustc.clone(), self.config.rustdoc.clone())
+        };
+        let version = self.native(&rustc, vec!["-vV".into()], Some(cwd.clone()))?;
+        let report = String::from_utf8_lossy(&version);
+        let field = |name: &str| {
+            report
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .ok_or(CacheError::Provider)
+        };
+        let release = field("release: ")?;
+        let host = field("host: ")?;
+        field("commit-hash: ")?;
+        if self.config.rustup.is_none() {
+            fallback_toolchain(&cwd, release, host)?;
+            if selected.as_ref().is_some_and(|channel| {
+                channel != release
+                    && channel != format!("{release}-{host}").as_str()
+                    && channel != "stable"
+            }) {
+                return Err(CacheError::Configuration);
+            }
+        }
+        let mut identity = version;
+        identity.extend(rustc.as_os_str().as_encoded_bytes());
+        let lane_name = digest(&identity);
+        let lane_path = Path::new("cargo/lanes").join(&lane_name);
+        let lane = prepare(&self.root, &lane_path)?;
+        let _lease = lease(&lane, false, true)?;
+        let workspace = digest(cwd.as_os_str().as_encoded_bytes());
+        let target_path = lane_path.join("targets").join(workspace);
+        let target = prepare(&self.root, &target_path)?;
+        use_cache(&target)?;
+        directory(&self.root, Path::new("cargo/home"))?;
+        lane.create_dir_all("build")?;
+        target.create_dir_all("cache")?;
+        let root = &self.config.root;
+        let compiler_bin = rustc.parent().ok_or(CacheError::Provider)?;
+        let path = std::env::join_paths(
+            self.config
+                .frontends
+                .iter()
+                .cloned()
+                .chain(std::iter::once(compiler_bin.to_owned()))
+                .chain(std::env::split_paths(
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                )),
+        )
+        .map_err(|_| CacheError::Configuration)?;
+        let mut env = vec![
+            ("CARGO_HOME".into(), self.cargo_home()?.into_os_string()),
+            (
+                "CARGO_TARGET_DIR".into(),
+                root.join(&target_path).join("cache").into_os_string(),
+            ),
+            (
+                "CARGO_BUILD_BUILD_DIR".into(),
+                root.join(&lane_path).join("build").into_os_string(),
+            ),
+            ("RUSTC".into(), rustc.into_os_string()),
+            ("RUSTDOC".into(), rustdoc.into_os_string()),
+            ("PATH".into(), path),
+        ];
+        if let Some(channel) = selected {
+            env.push(("RUSTUP_TOOLCHAIN".into(), channel));
+        }
+        if let Some(home) = &self.config.rustup_home {
+            env.push(("RUSTUP_HOME".into(), home.as_os_str().to_owned()));
+        }
+        let mut native_args = vec!["-Zmtime-on-use".into(), "-Zgc".into()];
+        native_args.extend_from_slice(args);
+        Err(self
+            .command(&self.config.cargo, env, &native_args)
+            .exec()
+            .into())
+    }
+    pub fn run_tool(&self, tool: &str, args: &[OsString]) -> Result<()> {
+        let (executable, variable, lock) = match tool {
+            "uv" => (self.config.uv.as_ref(), "UV_CACHE_DIR", "uv.lock"),
+            "bun" => (
+                self.config.bun.as_ref(),
+                "BUN_INSTALL_CACHE_DIR",
+                "bun.lock",
+            ),
+            _ => return Err(CacheError::Configuration),
+        };
+        if args
+            .iter()
+            .any(|a| a == "cache" || a.to_str().is_some_and(|a| a.starts_with("--cache-dir")))
+        {
+            return Err(CacheError::Configuration);
+        }
+        let executable = executable.ok_or(CacheError::Provider)?;
+        self.version(executable, &qualified(tool)?)?;
+        let cwd = fs::canonicalize(std::env::current_dir()?)?;
+        // Exact lock content creates a reusable immutable dependency generation.
+        // Unlocked operations get a daily generation; arguments are never stored.
+        let mut identity = cwd.as_os_str().as_encoded_bytes().to_vec();
+        for argument in args {
+            identity.push(0);
+            identity.extend(argument.as_encoded_bytes());
+        }
+        let lock_path = cwd.join(lock);
+        if lock_path.is_file() {
+            let file = fs::File::open(lock_path)?;
+            if file.metadata()?.len() > 16 * 1024 * 1024 {
+                return Err(CacheError::Configuration);
+            }
+            file.take(16 * 1024 * 1024 + 1).read_to_end(&mut identity)?;
+        } else {
+            identity.extend_from_slice(&(now()? / 86400).to_le_bytes());
+        }
+        let shard_path = Path::new(tool).join(digest(&identity));
+        let shard = prepare(&self.root, &shard_path)?;
+        let _lease = lease(&shard, false, true)?;
+        use_cache(&shard)?;
+        shard.create_dir_all("cache")?;
+        Err(self
+            .command(
+                executable,
+                vec![(
+                    variable.into(),
+                    self.config
+                        .root
+                        .join(shard_path)
+                        .join("cache")
+                        .into_os_string(),
+                )],
+                args,
+            )
+            .exec()
+            .into())
+    }
+}
+
+#[derive(Default, Serialize)]
+pub struct Report {
+    pub schema: u8,
+    pub dry_run: bool,
+    pub retention_seconds: u64,
+    pub stale_units: usize,
+    pub removed_units: usize,
+    pub busy: usize,
+    pub unknown: usize,
+    pub native_cache_runs: usize,
+    pub source_gc_deferred: bool,
+    pub completed_uses: usize,
+}
+struct Budget {
+    entries: usize,
+    start: Instant,
+}
+impl Budget {
+    fn visit(&mut self) -> Result<()> {
+        self.entries += 1;
+        if self.entries > MAX_ENTRIES || self.start.elapsed() > Duration::from_secs(20) {
+            Err(CacheError::Budget)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn stamp(dir: &Dir) -> Result<Option<SystemTime>> {
+    let fingerprints = match directory(dir, Path::new("fingerprint")) {
+        Ok(dir) => dir,
+        Err(_) => return Ok(None),
+    };
+    let mut newest = None;
+    for (index, entry) in fingerprints.entries()?.enumerate() {
+        if index >= 256 {
+            return Ok(None);
+        }
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.ends_with(".json")
+            || ![
+                "lib-",
+                "bin-",
+                "test-",
+                "example-",
+                "build-script-",
+                "run-build-script-",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            continue;
+        }
+        let bytes = regular(&fingerprints, Path::new(name), 16)?;
+        if bytes.len() != 16 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+            return Ok(None);
+        }
+        let modified = fingerprints.open(name)?.metadata()?.modified()?.into_std();
+        newest = Some(newest.map_or(modified, |last: SystemTime| last.max(modified)));
+    }
+    Ok(newest)
+}
+fn artifact_units(
+    dir: &Dir,
+    depth: usize,
+    current: u64,
+    apply: bool,
+    report: &mut Report,
+    budget: &mut Budget,
+) -> Result<()> {
+    for entry in dir.entries()? {
+        budget.visit()?;
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            report.unknown += 1;
+            continue;
+        };
+        let child = directory(dir, Path::new(&name))?;
+        if name_str == "build" {
+            for package in child.entries()? {
+                budget.visit()?;
+                let package = package?;
+                if !package.file_type()?.is_dir() {
+                    continue;
+                }
+                let package_dir = directory(&child, Path::new(&package.file_name()))?;
+                for unit in package_dir.entries()? {
+                    budget.visit()?;
+                    let unit = unit?;
+                    let name = unit.file_name();
+                    if !unit.file_type()?.is_dir()
+                        || !name.to_str().is_some_and(|s| hash_name(s, 16))
+                    {
+                        report.unknown += 1;
+                        continue;
+                    }
+                    let unit_dir = directory(&package_dir, Path::new(&name))?;
+                    if let Some(modified) = stamp(&unit_dir)? {
+                        let seconds = modified
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(|_| CacheError::Ownership)?
+                            .as_secs();
+                        if expired(seconds, current) {
+                            report.stale_units += 1;
+                            if apply {
+                                unit_dir.remove_open_dir_all()?;
+                                report.removed_units += 1;
+                            }
+                        }
+                    } else {
+                        report.unknown += 1;
+                    }
+                }
+            }
+        } else if depth < 4 && !name_str.starts_with('.') {
+            artifact_units(&child, depth + 1, current, apply, report, budget)?;
+        }
+    }
+    Ok(())
+}
+impl ManagedCache {
+    pub fn collect(&self, apply: bool) -> Result<Report> {
+        self.collect_at(apply, now()?)
+    }
+    fn collect_at(&self, apply: bool, current: u64) -> Result<Report> {
+        let _cleaner = lease(&self.root, true, false)?;
+        self.version(&self.config.cargo, &qualified("cargo")?)?;
+        let mut report = Report {
+            schema: 1,
+            dry_run: !apply,
+            retention_seconds: RETENTION.as_secs(),
+            ..Report::default()
+        };
+        let mut budget = Budget {
+            entries: 0,
+            start: Instant::now(),
+        };
+        let lanes = directory(&self.root, Path::new("cargo/lanes"))?;
+        let mut cargo_busy = false;
+        for entry in lanes.entries()? {
+            budget.visit()?;
+            let entry = entry?;
+            let name = entry.file_name();
+            if !entry.file_type()?.is_dir() || !name.to_str().is_some_and(|s| hash_name(s, 64)) {
+                report.unknown += 1;
+                continue;
+            }
+            let lane = directory(&lanes, Path::new(&name))?;
+            let _lease = match lease(&lane, true, false) {
+                Ok(lease) => lease,
+                Err(CacheError::Busy) => {
+                    report.busy += 1;
+                    cargo_busy = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if let Ok(build) = directory(&lane, Path::new("build")) {
+                artifact_units(&build, 0, current, apply, &mut report, &mut budget)?;
+            }
+            if let Ok(targets) = directory(&lane, Path::new("targets")) {
+                for entry in targets.entries()? {
+                    budget.visit()?;
+                    let entry = entry?;
+                    let name = entry.file_name();
+                    if !entry.file_type()?.is_dir()
+                        || !name.to_str().is_some_and(|s| hash_name(s, 64))
+                    {
+                        report.unknown += 1;
+                        continue;
+                    }
+                    let target = directory(&targets, Path::new(&name))?;
+                    if completed_use(&target, current, apply)? {
+                        report.completed_uses += 1;
+                        continue;
+                    }
+                    match last_use(&target) {
+                        Ok(last) if expired(last, current) => {
+                            report.stale_units += 1;
+                            if apply {
+                                target.remove_open_dir_all()?;
+                                report.removed_units += 1;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => report.unknown += 1,
+                    }
+                }
+            }
+        }
+        for (tool, executable, variable) in [
+            ("uv", self.config.uv.as_ref(), "UV_CACHE_DIR"),
+            ("bun", self.config.bun.as_ref(), "BUN_INSTALL_CACHE_DIR"),
+        ] {
+            let shards = directory(&self.root, Path::new(tool))?;
+            for entry in shards.entries()? {
+                budget.visit()?;
+                let entry = entry?;
+                let name = entry.file_name();
+                if !entry.file_type()?.is_dir() || !name.to_str().is_some_and(|s| hash_name(s, 64))
+                {
+                    report.unknown += 1;
+                    continue;
+                }
+                let shard = directory(&shards, Path::new(&name))?;
+                let _lease = match lease(&shard, true, false) {
+                    Ok(lease) => lease,
+                    Err(CacheError::Busy) => {
+                        report.busy += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if completed_use(&shard, current, apply)? {
+                    report.completed_uses += 1;
+                    continue;
+                }
+                let last = match last_use(&shard) {
+                    Ok(last) => last,
+                    Err(_) => {
+                        report.unknown += 1;
+                        continue;
+                    }
+                };
+                if !expired(last, current) {
+                    continue;
+                }
+                report.stale_units += 1;
+                if !apply {
+                    continue;
+                }
+                let executable = executable.ok_or(CacheError::Provider)?;
+                self.version(executable, &qualified(tool)?)?;
+                directory(&shard, Path::new("cache"))?;
+                let mut env = OsString::from(format!("{variable}="));
+                env.push(self.config.root.join(tool).join(&name).join("cache"));
+                let mut args = vec![env, executable.as_os_str().to_owned()];
+                args.extend(if tool == "uv" {
+                    vec!["cache".into(), "clean".into()]
+                } else {
+                    vec![
+                        "pm".into(),
+                        "cache".into(),
+                        "prune".into(),
+                        "--max-age".into(),
+                        "3".into(),
+                    ]
+                });
+                self.native(Path::new("/usr/bin/env"), args, None)?;
+                report.native_cache_runs += 1;
+                // Keep ledger and native Bun store links. No raw cache tree removal.
+            }
+        }
+        if cargo_busy {
+            report.source_gc_deferred = true;
+            return Ok(report);
+        }
+        let mut env = OsString::from("CARGO_HOME=");
+        env.push(self.cargo_home()?);
+        let mut args = vec![
+            env,
+            self.config.cargo.as_os_str().to_owned(),
+            "-Zgc".into(),
+            "clean".into(),
+            "gc".into(),
+        ];
+        for option in [
+            "--max-src-age",
+            "--max-crate-age",
+            "--max-index-age",
+            "--max-git-co-age",
+            "--max-git-db-age",
+        ] {
+            args.push(format!("{option}=3days").into());
+        }
+        if !apply {
+            args.push("--dry-run".into());
+        }
+        self.native(Path::new("/usr/bin/env"), args, None)?;
+        report.native_cache_runs += 1;
+        Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs::FileTimes, os::unix::fs::symlink, process::Stdio};
+    fn fixture() -> (tempfile::TempDir, Config) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap().join("managed");
+        (
+            temp,
+            Config {
+                schema: 1,
+                root,
+                cargo: "/nonexistent/cargo".into(),
+                rustc: "/nonexistent/rustc".into(),
+                rustdoc: "/nonexistent/rustdoc".into(),
+                rustup: None,
+                rustup_home: None,
+                frontends: None,
+                cargo_home: None,
+                uv: None,
+                bun: None,
+            },
+        )
+    }
+    fn unit(base: &Path, name: &str, stamp_age: u64) -> PathBuf {
+        let path = base.join("debug/build/package").join(name);
+        fs::create_dir_all(path.join("fingerprint")).unwrap();
+        let fingerprint = path.join("fingerprint/lib-package");
+        fs::write(&fingerprint, b"1234567890abcdef").unwrap();
+        fs::File::open(&fingerprint)
+            .unwrap()
+            .set_times(
+                FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(stamp_age)),
+            )
+            .unwrap();
+        fs::write(path.join("rebuildable.rlib"), b"artifact").unwrap();
+        path
+    }
+    fn scan(root: &Path, apply: bool) -> Report {
+        let dir = Dir::open_ambient_dir(root, ambient_authority()).unwrap();
+        let mut report = Report::default();
+        artifact_units(
+            &dir,
+            0,
+            now().unwrap(),
+            apply,
+            &mut report,
+            &mut Budget {
+                entries: 0,
+                start: Instant::now(),
+            },
+        )
+        .unwrap();
+        report
+    }
+    #[test]
+    fn retention_is_strict_and_clock_rollback_preserves() {
+        assert!(!expired(100, 100 + RETENTION.as_secs()));
+        assert!(expired(100, 101 + RETENTION.as_secs()));
+        assert!(!expired(100, 99));
+    }
+    #[test]
+    fn initialization_refuses_foreign_contents() {
+        let (_temp, config) = fixture();
+        fs::create_dir(&config.root).unwrap();
+        fs::set_permissions(&config.root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(config.root.join("work"), b"keep").unwrap();
+        assert!(matches!(
+            ManagedCache::initialize(config),
+            Err(CacheError::Ownership)
+        ));
+    }
+    #[test]
+    fn initialization_refuses_symlink_root() {
+        let (temp, config) = fixture();
+        symlink(temp.path(), &config.root).unwrap();
+        assert!(matches!(
+            ManagedCache::initialize(config),
+            Err(CacheError::Ownership)
+        ));
+    }
+    #[test]
+    fn marker_is_required_and_not_synthesized_on_open() {
+        let (_temp, config) = fixture();
+        let root = config.root.clone();
+        let cache = ManagedCache::initialize(config).unwrap();
+        fs::write(root.join(".nds-cache"), b"other owner").unwrap();
+        assert!(matches!(
+            ManagedCache::open(cache.config),
+            Err(CacheError::Ownership)
+        ));
+    }
+    #[test]
+    fn stale_native_unit_is_removed_as_a_whole() {
+        let (temp, _) = fixture();
+        let path = unit(temp.path(), "0123456789abcdef", RETENTION.as_secs() + 10);
+        let report = scan(temp.path(), true);
+        assert_eq!(report.removed_units, 1);
+        assert!(!path.exists());
+    }
+    #[test]
+    fn dry_run_preserves_and_fresh_reuse_keeps_old_artifact() {
+        let (temp, _) = fixture();
+        let old = unit(temp.path(), "0123456789abcdef", RETENTION.as_secs() + 10);
+        assert_eq!(scan(temp.path(), false).stale_units, 1);
+        assert!(old.exists());
+        fs::File::open(old.join("fingerprint/lib-package"))
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(SystemTime::now()))
+            .unwrap();
+        assert_eq!(scan(temp.path(), true).removed_units, 0);
+        assert!(old.join("rebuildable.rlib").exists());
+    }
+    #[test]
+    fn unknown_fingerprint_and_layout_are_preserved() {
+        let (temp, _) = fixture();
+        let path = unit(temp.path(), "0123456789abcdef", RETENTION.as_secs() + 10);
+        fs::write(path.join("fingerprint/lib-package"), b"unsupported").unwrap();
+        let other = unit(temp.path(), "other-layout", RETENTION.as_secs() + 10);
+        let report = scan(temp.path(), true);
+        assert_eq!(report.removed_units, 0);
+        assert_eq!(report.unknown, 2);
+        assert!(other.exists());
+    }
+    #[test]
+    fn symlink_unit_cannot_escape_anchored_cache() {
+        let (temp, _) = fixture();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("precious"), b"keep").unwrap();
+        fs::create_dir_all(temp.path().join("debug/build/package")).unwrap();
+        symlink(
+            outside.path(),
+            temp.path().join("debug/build/package/0123456789abcdef"),
+        )
+        .unwrap();
+        assert_eq!(scan(temp.path(), true).removed_units, 0);
+        assert_eq!(fs::read(outside.path().join("precious")).unwrap(), b"keep");
+    }
+    #[test]
+    fn regular_control_files_never_follow_links() {
+        let (temp, _) = fixture();
+        let dir = Dir::open_ambient_dir(temp.path(), ambient_authority()).unwrap();
+        let external = tempfile::NamedTempFile::new().unwrap();
+        symlink(external.path(), temp.path().join(".last-use")).unwrap();
+        assert!(regular(&dir, Path::new(".last-use"), 32).is_err());
+    }
+    #[test]
+    fn active_shared_lease_blocks_collection() {
+        let (_temp, config) = fixture();
+        let cache = ManagedCache::initialize(config).unwrap();
+        let first = lease(&cache.root, false, false).unwrap();
+        assert!(matches!(
+            lease(&cache.root, true, false),
+            Err(CacheError::Busy)
+        ));
+        drop(first);
+        assert!(lease(&cache.root, true, false).is_ok());
+    }
+    #[test]
+    fn native_child_inherits_lease_after_parent_exit() {
+        let (_temp, config) = fixture();
+        let cache = ManagedCache::initialize(config).unwrap();
+        let inherited = lease(&cache.root, false, true).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 1 & exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        drop(inherited);
+        assert!(child.wait().unwrap().success());
+        assert!(matches!(
+            lease(&cache.root, true, false),
+            Err(CacheError::Busy)
+        ));
+        let start = Instant::now();
+        loop {
+            if lease(&cache.root, true, false).is_ok() {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    #[test]
+    fn traversal_budget_is_enforced() {
+        let mut budget = Budget {
+            entries: MAX_ENTRIES,
+            start: Instant::now(),
+        };
+        assert!(matches!(budget.visit(), Err(CacheError::Budget)));
+    }
+    #[test]
+    fn completion_observation_preserves_recent_long_running_work_and_preview_is_read_only() {
+        let (_temp, config) = fixture();
+        let cache = ManagedCache::initialize(config).unwrap();
+        use_cache(&cache.root).unwrap();
+        cache.root.write(".last-use", b"1").unwrap();
+        assert!(completed_use(&cache.root, RETENTION.as_secs() * 10, false).unwrap());
+        assert_eq!(last_use(&cache.root).unwrap(), 1);
+        assert!(completed_use(&cache.root, RETENTION.as_secs() * 10, true).unwrap());
+        assert_eq!(last_use(&cache.root).unwrap(), RETENTION.as_secs() * 10);
+        assert!(!completed_use(&cache.root, RETENTION.as_secs() * 10, true).unwrap());
+    }
+    #[test]
+    fn fixed_compiler_refuses_a_different_project_pin() {
+        let (temp, _) = fixture();
+        fs::write(
+            temp.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel=\"1.98.0\"\n",
+        )
+        .unwrap();
+        assert!(fallback_toolchain(temp.path(), "1.99.1", "aarch64-apple-darwin").is_err());
+        fs::write(
+            temp.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel=\"1.99.1\"\n",
+        )
+        .unwrap();
+        assert!(fallback_toolchain(temp.path(), "1.99.1", "aarch64-apple-darwin").is_ok());
+    }
+    #[test]
+    fn own_use_ledger_is_atomic_and_bounded() {
+        let (_temp, config) = fixture();
+        let cache = ManagedCache::initialize(config).unwrap();
+        use_cache(&cache.root).unwrap();
+        assert!(now().unwrap() - last_use(&cache.root).unwrap() <= 1);
+        cache.root.write(".last-use", b"invalid").unwrap();
+        assert!(last_use(&cache.root).is_err());
+    }
+}

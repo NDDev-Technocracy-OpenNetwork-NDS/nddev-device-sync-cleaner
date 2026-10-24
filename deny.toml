@@ -10,3 +10,9 @@ wildcards = "deny"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-git = ["https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-agent"]
+
+# cap-std's locked Windows support dependency grants the LLVM linking exception.
+[[licenses.exceptions]]
+name = "winx"
+version = "=0.36.4"
+allow = ["Apache-2.0 WITH LLVM-exception"]

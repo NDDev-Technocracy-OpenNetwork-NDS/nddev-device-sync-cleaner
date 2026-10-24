@@ -1,8 +1,10 @@
-//! Read-only views of the native cleaner's policy and observed outcomes.
+//! Native cleaner observations and opt-in local development-cache maintenance.
 //! The cleaner owns maintenance decisions, reports and cache preservation.
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod adapter;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod cache;
 pub mod view;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]

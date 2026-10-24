@@ -63,6 +63,13 @@ jobs:
           cargo install --locked --version 0.22.2 cargo-audit
           cargo deny check
           cargo audit
+      - name: Qualify managed development cache owners
+        if: runner.os == 'Linux' || (runner.os == 'macOS' && runner.arch == 'ARM64')
+        shell: bash
+        run: |
+          python3 scripts/prepare-cache-tools.py "$RUNNER_TEMP/cache-owners"
+          cargo build --locked --bin nds-cleaner-cache
+          python3 scripts/check-cache-provider.py --binary target/debug/nds-cleaner-cache --tools "$RUNNER_TEMP/cache-owners/bin" --rustc "$(rustup which rustc)" --rustdoc "$(rustup which rustdoc)"
       - name: Fetch verified native provider
         if: runner.os == 'Linux'
         env:
