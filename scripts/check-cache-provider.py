@@ -45,6 +45,14 @@ def qualify(binary, tools, rustc, rustdoc):
         root = base / "cache"
         config = base / "config.json"
         rustup = shutil.which("rustup")
+        if rustup:
+            # Exercise the native multicall symlink layout used by macOS runners.
+            native_dir = base / "native"
+            native_dir.mkdir()
+            shutil.copyfile(Path(rustup).resolve(), native_dir / "rustup-init")
+            (native_dir / "rustup-init").chmod(0o755)
+            (native_dir / "rustup").symlink_to("rustup-init")
+            rustup = str(native_dir / "rustup")
         config.write_text(json.dumps({"schema": 1, "root": str(root), "cargo": str(tools / "cargo"),
                                      "rustc": str(rustc), "rustdoc": str(rustdoc), "rustup": rustup,
                                      "rustup_home": call([rustup, "show", "home"]).strip() if rustup else None,
@@ -54,6 +62,8 @@ def qualify(binary, tools, rustc, rustdoc):
         fixture_env = dict(os.environ)
         for key in ("CARGO", "CARGO_HOME", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC", "RUSTDOC", "RUSTUP_TOOLCHAIN", "NDS_CLEANER_MANAGED_BUILD_DIR", "NDS_CLEANER_MANAGED_TARGET_DIR", "NDS_CLEANER_NESTING"):
             fixture_env.pop(key, None)
+        if rustup:
+            fixture_env["RUSTUP_TOOLCHAIN"] = "1.99.1"
         def run(tool, *args, cwd=base, overrides=None):
             return call([binary, config, tool, *args], cwd=cwd, environment=dict(fixture_env, **(overrides or {})))
         run("init")
