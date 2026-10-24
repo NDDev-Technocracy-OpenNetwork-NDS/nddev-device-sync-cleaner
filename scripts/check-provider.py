@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 OWNER = 'cleaner'
 binary = Path(os.environ["NDS_TEST_" + OWNER.upper()]).resolve(strict=True)
 build = subprocess.run(["cargo", "test", "--locked", "--test", "provider", "--no-run", "--message-format=json"], cwd=ROOT, text=True, capture_output=True, check=True, timeout=180)
-executables = [item["executable"] for line in build.stdout.splitlines() if (item := json.loads(line)).get("reason") == "compiler-artifact" and item.get("executable")]
+executables = [item["executable"] for line in build.stdout.splitlines() if (item := json.loads(line)).get("reason") == "compiler-artifact" and item.get("executable") and item.get("target", {}).get("name") == "provider"]
 assert len(executables) == 1
 with tempfile.TemporaryDirectory(prefix="nds-" + OWNER + "-") as temporary:
     home = Path(temporary)

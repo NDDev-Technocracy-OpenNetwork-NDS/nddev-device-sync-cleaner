@@ -1,0 +1,84 @@
+{
+  "schema": 1,
+  "cargo_manifest": {
+    "url": "https://static.rust-lang.org/dist/2026-10-24/channel-rust-nightly.toml",
+    "sha256": "69c91d3ad09693e3584b8497644d4b66895b6bd65f1969aefb81a188ad85abd1"
+  },
+  "versions": {
+    "cargo": "cargo 1.101.0-nightly (15be64aa0 2026-10-20)",
+    "uv": "uv 0.13.5",
+    "bun": "1.4.4"
+  },
+  "platforms": {
+    "linux-x86_64": {
+      "cargo": {
+        "url": "https://static.rust-lang.org/dist/2026-10-24/cargo-nightly-x86_64-unknown-linux-gnu.tar.xz",
+        "sha256": "e1445ac2dc3c74a9976e5878214f39f0ea9f7ec353bf0074a8a9c2c412e096f0",
+        "members": {
+          "cargo": "cargo-nightly-x86_64-unknown-linux-gnu/cargo/bin/cargo"
+        },
+        "binary_sha256": {
+          "cargo": "e3a2d1a0d70838909822cb944069f571cc30c48b2d602374a2b324c1c0da7c80"
+        }
+      },
+      "uv": {
+        "url": "https://github.com/astral-sh/uv/releases/download/0.13.5/uv-x86_64-unknown-linux-gnu.tar.gz",
+        "sha256": "f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f",
+        "members": {
+          "uv": "uv-x86_64-unknown-linux-gnu/uv",
+          "uvx": "uv-x86_64-unknown-linux-gnu/uvx"
+        },
+        "version_report": "uv 0.13.5 (x86_64-unknown-linux-gnu)",
+        "binary_sha256": {
+          "uv": "8a70db72685b7138121bfcda71fa1a00cb709ed9f1fdc4ecf1dd871e8e167e52",
+          "uvx": "a54e15e5ff32ac5432fdd7a9819e2b2a326651f0589d6b58b8b98c3cc28d3592"
+        }
+      },
+      "bun": {
+        "url": "https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64.zip",
+        "sha256": "bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c",
+        "members": {
+          "bun": "bun-linux-x64/bun"
+        },
+        "binary_sha256": {
+          "bun": "10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235"
+        }
+      }
+    },
+    "darwin-arm64": {
+      "cargo": {
+        "url": "https://static.rust-lang.org/dist/2026-10-24/cargo-nightly-aarch64-apple-darwin.tar.xz",
+        "sha256": "ce1d4de5d7bbbf88b9a9e39a88ae6fad8042605aa4715f4e51a54aff6c337bc7",
+        "members": {
+          "cargo": "cargo-nightly-aarch64-apple-darwin/cargo/bin/cargo"
+        },
+        "binary_sha256": {
+          "cargo": "7fbd2ff4b1c8ee5c6772466abf001024fe1ac1c5f276167f05fe5460bd4488e7"
+        }
+      },
+      "uv": {
+        "url": "https://github.com/astral-sh/uv/releases/download/0.13.5/uv-aarch64-apple-darwin.tar.gz",
+        "sha256": "743f85035a1996ecb350659e01cd9faea9709829be09b1b4b03c73eaf3c9cd73",
+        "members": {
+          "uv": "uv-aarch64-apple-darwin/uv",
+          "uvx": "uv-aarch64-apple-darwin/uvx"
+        },
+        "version_report": "uv 0.13.5 (46776a95d 2026-10-21 aarch64-apple-darwin)",
+        "binary_sha256": {
+          "uv": "7dad6047467a9d6b081c033cb3efed9ba39a4799c698d09e6cd598f3a6a32338",
+          "uvx": "e34502e6f7204735483527b722dbff2a505fc28a19d8026d2eb3d179fa4a8ad9"
+        }
+      },
+      "bun": {
+        "url": "https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-darwin-aarch64.zip",
+        "sha256": "c240d7f0ccb90c263a849fcdb09b7ee62630d921348ed6aafda86b9d577bc510",
+        "members": {
+          "bun": "bun-darwin-aarch64/bun"
+        },
+        "binary_sha256": {
+          "bun": "0a2237cdcfa0d16ef501d9acca9f0026309ef348bea7393a64e8d1e3609565cc"
+        }
+      }
+    }
+  }
+}

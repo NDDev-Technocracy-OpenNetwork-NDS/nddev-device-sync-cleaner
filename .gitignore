@@ -1,2 +1,5 @@
 /target/
 .nddev-reports/
+
+__pycache__/
+*.py[cod]
