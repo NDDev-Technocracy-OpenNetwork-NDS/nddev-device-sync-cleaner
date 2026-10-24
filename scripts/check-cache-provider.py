@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import signal
+import shutil
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -43,8 +44,10 @@ def qualify(binary, tools, rustc, rustdoc):
         base = Path(temporary).resolve()
         root = base / "cache"
         config = base / "config.json"
+        rustup = shutil.which("rustup")
         config.write_text(json.dumps({"schema": 1, "root": str(root), "cargo": str(tools / "cargo"),
-                                     "rustc": str(rustc), "rustdoc": str(rustdoc), "rustup": None,
+                                     "rustc": str(rustc), "rustdoc": str(rustdoc), "rustup": rustup,
+                                     "rustup_home": call([rustup, "show", "home"]).strip() if rustup else None,
                                      "frontends": str(base / "frontends"), "cargo_home": None,
                                      "uv": str(tools / "uv"), "bun": str(tools / "bun")}))
         call([sys.executable, REPO / "scripts/install-cache-frontends.py", config, binary])
@@ -82,6 +85,12 @@ def qualify(binary, tools, rustc, rustdoc):
         second = build(apps[1])
         assert next(item for item in second if item.get("target", {}).get("name") == "nds_cache_shared_dep")["fresh"]
         assert stamp.stat().st_mtime > old + RETENTION
+        if rustup:
+            shim = base / "frontends/rustup"
+            assert call([shim, "run", "1.99.1", "cargo", "--version"], environment=fixture_env).strip() == versions["cargo"]
+            assert call([shim, "which", "--toolchain", "1.99.1", "rustc"], environment=fixture_env) == call([rustup, "which", "--toolchain", "1.99.1", "rustc"], environment=fixture_env)
+            events = [json.loads(line) for line in call([shim, "run", "1.99.1", "cargo", "build", "--locked", "--message-format=json"], cwd=apps[1], environment=fixture_env).splitlines() if line.startswith('{')]
+            assert next(item for item in events if item.get("target", {}).get("name") == "nds_cache_shared_dep")["fresh"]
         executables = [Path(next(item["executable"] for item in events if item.get("executable")))
                        for events in (first, second)]
         assert executables[0] != executables[1]
@@ -205,7 +214,7 @@ def qualify(binary, tools, rustc, rustdoc):
         assert sum(after) < sum(before)
         assert call([python / ".venv/bin/python", "-c", "import idna,sys;print(sys.version_info[:3])"]).strip() == "(3, 15, 1)"
         assert call([tools / "bun", "-e", 'console.log(require("is-number")(7))'], cwd=javascript).strip() == "true"
-        return {"cargo_cross_project_warm_hit": True, "separate_final_binaries": True,
+        return {"cargo_cross_project_warm_hit": True, "rustup_cargo_routing": bool(rustup), "separate_final_binaries": True,
                 "caller_owned_inputs_preserved": True, "manifest_target_isolation": True, "native_and_wrapped_nested_builds": True,
                 "warm_use_refreshes_native_stamp": True, "stale_artifact_gc": True,
                 "native_source_gc": True, "native_child_lease_survives_parent": True,
