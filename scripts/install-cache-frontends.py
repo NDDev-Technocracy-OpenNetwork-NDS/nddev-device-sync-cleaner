@@ -25,8 +25,9 @@ def install(config_path, binary):
     contents = {name: "#!/bin/sh\n" + MARKER + "exec " + shlex.join([str(binary), str(config_path), *operation]) + ' "$@"\n'
                 for name, operation in commands.items()}
     if config.get("rustup"):
-        native = Path(config["rustup"]).resolve(strict=True)
-        if not native.is_absolute() or native == root / "rustup":
+        native = Path(config["rustup"])
+        # Rustup is a multicall binary: preserve its invoked name through symlinks.
+        if not native.is_absolute() or not native.is_file() or native.resolve() == (root / "rustup").resolve():
             raise ValueError("rustup backend must be a separate native executable")
         contents["rustup"] = ("#!/bin/sh\n" + MARKER
             + 'if [ "$#" -ge 3 ] && [ "$1" = run ] && [ "$3" = cargo ]; then\n'
