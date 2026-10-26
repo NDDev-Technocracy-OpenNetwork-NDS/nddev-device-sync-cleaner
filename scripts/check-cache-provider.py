@@ -186,6 +186,8 @@ fn reads_current_checkout() {
 
     # Benign parent config must not erase generated recursion context. Child
     # metadata observes actual native paths without compiling the child.
+    # Qualify benign pre-command global config in the same native matcher as
+    # generated defaults; split root/subcommand config remains a parity gap.
     nesting_context = []
     for label, options in (("plain", []), ("offline", ["--config", "net.offline=true"])):
         case = base / ("managed-context-" + label)
@@ -213,7 +215,7 @@ fn reads_current_checkout() {
             + '.output().unwrap();assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));'
             + 'std::fs::write(' + json.dumps(str(proof)) + ',output.stdout).unwrap();}\n'
         )
-        run("cargo", "build", "--locked", "--offline", *options, cwd=parent,
+        run("cargo", *options, "build", "--locked", "--offline", cwd=parent,
             overrides={"CARGO_HOME": str(home)})
         parent_build = Path((case / "parent-build").read_text())
         parent_target = Path((case / "parent-target").read_text())
@@ -228,8 +230,8 @@ fn reads_current_checkout() {
         paths = []
         for depth in range(1, 9):
             if depth > 1:
-                metadata = json.loads(run("cargo", "metadata", "--locked", "--offline", "--no-deps",
-                                          "--format-version", "1", *options, cwd=child, overrides=inherited))
+                metadata = json.loads(run("cargo", *options, "metadata", "--locked", "--offline", "--no-deps",
+                                          "--format-version", "1", cwd=child, overrides=inherited))
             build_parts = Path(metadata["build_directory"]).relative_to(root / "cargo/lanes").parts
             target_parts = Path(metadata["target_directory"]).relative_to(root / "cargo/lanes").parts
             assert len(build_parts) == 5 and build_parts[1:4] == ("build", "nested", str(depth))
@@ -242,8 +244,8 @@ fn reads_current_checkout() {
                          "NDS_CLEANER_MANAGED_TARGET_DIR": metadata["target_directory"], "NDS_CLEANER_NESTING": str(depth)}
         before = ledgers()
         try:
-            run("cargo", "metadata", "--locked", "--offline", "--no-deps", "--format-version", "1",
-                *options, cwd=child, overrides=inherited)
+            run("cargo", *options, "metadata", "--locked", "--offline", "--no-deps", "--format-version", "1",
+                cwd=child, overrides=inherited)
         except RuntimeError as error:
             assert "NDS Cleaner: managed cache configuration is invalid" in str(error)
         else:
