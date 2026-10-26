@@ -184,6 +184,75 @@ fn reads_current_checkout() {
         assert (parent / "Cargo.lock").read_bytes() == parent_lock
         assert (child / "Cargo.lock").read_bytes() == lock
 
+    # Benign parent config must not erase generated recursion context. Child
+    # metadata observes actual native paths without compiling the child.
+    nesting_context = []
+    for label, options in (("plain", []), ("offline", ["--config", "net.offline=true"])):
+        case = base / ("managed-context-" + label)
+        parent = case / "parent"
+        child = case / "child"
+        project(parent)
+        project(child)
+        parent_name = "nds-context-parent-" + label
+        (parent / "Cargo.toml").write_text((parent / "Cargo.toml").read_text().replace("nds-caller-target", parent_name))
+        parent_lock = lock.replace(b"nds-caller-target", parent_name.encode())
+        (parent / "Cargo.lock").write_bytes(parent_lock)
+        proof = case / "child-metadata.json"
+        context = [(name, case / filename) for name, filename in (
+            ("NDS_CLEANER_MANAGED_BUILD_DIR", "parent-build"),
+            ("NDS_CLEANER_MANAGED_TARGET_DIR", "parent-target"),
+            ("NDS_CLEANER_NESTING", "parent-depth"), ("OUT_DIR", "parent-out"))]
+        arguments = [str(config), "cargo", "metadata", "--locked", "--offline", "--no-deps",
+                     "--format-version", "1", "--manifest-path", str(child / "Cargo.toml")]
+        (parent / "build.rs").write_text(
+            'fn main(){for (name,path) in ['
+            + ','.join('(' + json.dumps(name) + ',' + json.dumps(str(path)) + ')' for name, path in context)
+            + ']{std::fs::write(path,std::env::var_os(name).expect("managed context missing").as_encoded_bytes()).unwrap();}'
+            + 'let output=std::process::Command::new(' + json.dumps(str(binary)) + ').args(['
+            + ','.join(json.dumps(arg) for arg in arguments) + ']).current_dir(' + json.dumps(str(child)) + ')'
+            + '.output().unwrap();assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));'
+            + 'std::fs::write(' + json.dumps(str(proof)) + ',output.stdout).unwrap();}\n'
+        )
+        run("cargo", "build", "--locked", "--offline", *options, cwd=parent,
+            overrides={"CARGO_HOME": str(home)})
+        parent_build = Path((case / "parent-build").read_text())
+        parent_target = Path((case / "parent-target").read_text())
+        assert (case / "parent-depth").read_text() == "0"
+        assert Path((case / "parent-out").read_text()).is_relative_to(parent_build)
+        parent_parts = parent_build.relative_to(root / "cargo/lanes").parts
+        assert len(parent_parts) == 2 and parent_parts[1] == "build"
+        assert parent_target.relative_to(root / "cargo/lanes").parts[1] == "targets"
+        # Context is deliberately distinct from effective-path retention proof.
+        assert (parent_target.parent / ".last-use").exists() == (not options)
+        metadata = json.loads(proof.read_text())
+        paths = []
+        for depth in range(1, 9):
+            if depth > 1:
+                metadata = json.loads(run("cargo", "metadata", "--locked", "--offline", "--no-deps",
+                                          "--format-version", "1", *options, cwd=child, overrides=inherited))
+            build_parts = Path(metadata["build_directory"]).relative_to(root / "cargo/lanes").parts
+            target_parts = Path(metadata["target_directory"]).relative_to(root / "cargo/lanes").parts
+            assert len(build_parts) == 5 and build_parts[1:4] == ("build", "nested", str(depth))
+            assert len(target_parts) == 4 and target_parts[1] == "targets" and target_parts[3] == "cache"
+            assert build_parts[0] == target_parts[0] == parent_parts[0] and build_parts[4] == target_parts[2]
+            paths.append(metadata["build_directory"])
+            # Repeat actual observed native placement as inherited protocol
+            # context; this is not a claim of eight recursive compiler builds.
+            inherited = {"CARGO_HOME": str(home), "NDS_CLEANER_MANAGED_BUILD_DIR": metadata["build_directory"],
+                         "NDS_CLEANER_MANAGED_TARGET_DIR": metadata["target_directory"], "NDS_CLEANER_NESTING": str(depth)}
+        before = ledgers()
+        try:
+            run("cargo", "metadata", "--locked", "--offline", "--no-deps", "--format-version", "1",
+                *options, cwd=child, overrides=inherited)
+        except RuntimeError as error:
+            assert "NDS Cleaner: managed cache configuration is invalid" in str(error)
+        else:
+            raise AssertionError("inherited nesting depth9 unexpectedly succeeded")
+        assert ledgers() == before
+        assert (parent / "Cargo.lock").read_bytes() == parent_lock and (child / "Cargo.lock").read_bytes() == lock
+        nesting_context.append({"parent_config": label, "parent_depth": 0, "parent_hints_present": True,
+                                "child_build_directories": paths, "inherited_depth9_refused": True})
+
     # A caller may select an actual known managed target in another lane, also
     # as its explicit build-dir: retention follows namespace, not argument role.
     lane = hashlib.sha256(b"owned caller-target acceptance lane").hexdigest()
@@ -240,6 +309,7 @@ with open(sys.argv[1], "r+") as stream:
     assert sentinel.read_bytes() == b"preserved caller source home"
     assert all(path.read_bytes() == b"caller-owned placement" for path in sentinels[1:])
     return {"relocation": proofs, "nested_explicit_target_modes": list(nested_modes),
+            "managed_nesting_context": nesting_context,
             "known_managed_target_and_build_namespace": True, "native_errors_and_forwarded_argv": True,
             "caller_home_sentinel_sha256": hashlib.sha256(sentinel.read_bytes()).hexdigest(),
             "config_parity": "not qualified: hierarchical config and later CLI config remain separate gaps"}

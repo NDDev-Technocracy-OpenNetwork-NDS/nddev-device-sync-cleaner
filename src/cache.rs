@@ -743,19 +743,22 @@ impl ManagedCache {
         }
         native_args.extend_from_slice(args);
         let mut command = self.command(&self.config.cargo, env, &native_args);
-        for (key, known_default, path) in [
+        // Generated-default hints carry recursion context, not proof of the
+        // effective paths after caller configuration. Keep that context even
+        // with CLI config; only known_* above governs additional path retention.
+        for (key, generated_default, path) in [
             (
                 "NDS_CLEANER_MANAGED_BUILD_DIR",
-                default_build && !has_cli_config,
+                default_build,
                 &managed_build,
             ),
             (
                 "NDS_CLEANER_MANAGED_TARGET_DIR",
-                default_target && !has_cli_config,
+                default_target,
                 &managed_target,
             ),
         ] {
-            if known_default {
+            if generated_default {
                 command.env(key, path);
             } else {
                 command.env_remove(key);
