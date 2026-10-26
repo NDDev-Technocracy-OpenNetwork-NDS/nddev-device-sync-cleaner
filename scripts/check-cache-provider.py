@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real native cache qualification, entirely inside an owned temporary fixture."""
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -35,9 +36,218 @@ def call(command, *, cwd=None, timeout=120, environment=None):
 
 
 
-def qualify(binary, tools, rustc, rustdoc):
+def qualify_caller_targets(run, base, root, *, binary, config, tools, rustc, rustdoc, environment):
+    """Exercise caller placement with the real frontend, Cargo and compiler."""
+    home = base / "caller source home"
+    home.mkdir(mode=0o700)
+    sentinel = home / "owner-input"
+    sentinel.write_bytes(b"preserved caller source home")
+    lock = b'version = 3\n[[package]]\nname = "nds-caller-target"\nversion = "0.0.0"\n'
+
+    def project(path):
+        (path / "src").mkdir(parents=True)
+        (path / "Cargo.toml").write_text(
+            '[package]\nname="nds-caller-target"\nversion="0.0.0"\nedition="2024"\n'
+            '[[bin]]\nname="caller-placement"\npath="src/main.rs"\n'
+        )
+        (path / "Cargo.lock").write_bytes(lock)
+        (path / "input.txt").write_text("current checkout")
+        (path / "src/lib.rs").write_text('''#[test]
+fn reads_current_checkout() {
+    let compiled = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert_eq!(compiled, std::env::current_dir().unwrap());
+    assert_eq!(std::fs::read_to_string(compiled.join("input.txt")).unwrap(), "current checkout");
+}
+''')
+        (path / "src/main.rs").write_text('''fn main() {
+    assert_eq!(std::env::args().skip(1).collect::<Vec<_>>(), ["--target-dir", "literal"]);
+    println!("argv preserved");
+}
+''')
+
+    def artifact(output, name):
+        return next(item for item in (json.loads(line) for line in output.splitlines() if line.startswith('{'))
+                    if item.get("reason") == "compiler-artifact" and item["target"]["name"] == name
+                    and item.get("executable"))
+
+    def ledgers():
+        return {str(path): path.read_bytes() for path in root.glob("cargo/lanes/*/targets/*/.last-use")}
+
+    def owned_directory(path):
+        path.mkdir(parents=True)
+        marker = path / "preserve"
+        marker.write_bytes(b"caller-owned placement")
+        return marker
+
+    proofs = []
+    sentinels = [sentinel]
+    modes = ("env", "alias", "cli", "equals", "cli-priority", "env-priority",
+             "independent-build", "cli-independent-build")
+    for mode in modes:
+        case = base / ("caller-" + mode)
+        first = case / "first checkout"
+        second = case / "second checkout"
+        project(first)
+        targets = [case / name for name in ("first target", "second target")]
+        builds = [case / name for name in ("first build", "second build")]
+        ignored = [case / name for name in ("ignored special", "ignored alias")]
+        sentinels.extend(owned_directory(path) for path in targets + ignored)
+        independent_build = mode in ("independent-build", "cli-independent-build")
+        if independent_build:
+            sentinels.extend(owned_directory(path) for path in builds)
+        before = ledgers()
+        fresh = []
+        for index, checkout in ((0, first), (1, second), (1, second)):
+            if index == 1 and first.exists():
+                shutil.copytree(first, second, copy_function=shutil.copy2)
+                assert (first / "src/lib.rs").stat().st_mtime_ns == (second / "src/lib.rs").stat().st_mtime_ns
+                shutil.rmtree(first)  # Only this fresh, owned fixture checkout.
+            target = targets[index]
+            build = builds[index] if independent_build else target
+            overrides = {"CARGO_HOME": str(home)}
+            options = []
+            if mode in ("env", "env-priority", "independent-build"):
+                overrides["CARGO_TARGET_DIR"] = str(target)
+            elif mode == "alias":
+                overrides["CARGO_BUILD_TARGET_DIR"] = str(target)
+            else:
+                options = ["--target-dir=" + str(target)] if mode == "equals" else ["--target-dir", str(target)]
+            if mode in ("cli-priority", "env-priority"):
+                overrides["CARGO_BUILD_TARGET_DIR"] = str(ignored[1])
+            if mode == "cli-priority":
+                overrides["CARGO_TARGET_DIR"] = str(ignored[0])
+            if independent_build:
+                overrides["CARGO_BUILD_BUILD_DIR"] = str(build)
+            # Native metadata has no dedicated --target-dir option. CLI cases
+            # instead prove intermediate and final paths from actual artifacts.
+            if not options:
+                metadata = json.loads(run("cargo", "metadata", "--locked", "--offline", "--no-deps",
+                                          "--format-version", "1", cwd=checkout, overrides=overrides))
+                assert Path(metadata["target_directory"]) == target
+                assert Path(metadata["build_directory"]) == build
+            output = run("cargo", "test", "--locked", "--offline", "--lib", "--message-format=json",
+                         *options, cwd=checkout, overrides=overrides)
+            test = artifact(output, "nds_caller_target")
+            assert Path(test["executable"]).is_relative_to(build)
+            fresh.append(test["fresh"])
+        assert fresh == [False, False, True], (mode, fresh)
+        final = artifact(run("cargo", "build", "--locked", "--offline", "--bin", "caller-placement",
+                             "--message-format=json", *options, cwd=second, overrides=overrides), "caller-placement")
+        assert Path(final["executable"]).parent == targets[1] / "debug"
+        assert (second / "Cargo.lock").read_bytes() == lock
+        assert ledgers() == before  # No fictional managed final-output use.
+        assert all(sorted(path.iterdir()) == [path / "preserve"] for path in ignored)
+        proofs.append({"mode": mode, "fresh": fresh, "target": str(targets[1]),
+                       "test_executable": test["executable"], "final_executable": final["executable"]})
+
+    # New explicit child targets override inherited managed defaults, including
+    # an inherited build env equal to the parent's managed build hint.
+    nested_modes = ("env", "alias", "cli", "equals", "independent-build")
+    for mode in nested_modes:
+        case = base / ("caller-nested-" + mode)
+        parent = case / "parent"
+        child = case / "child"
+        target = case / "child target"
+        build = case / "child build" if mode == "independent-build" else target
+        project(parent)
+        project(child)
+        parent_name = "nds-caller-parent-" + mode
+        (parent / "Cargo.toml").write_text((parent / "Cargo.toml").read_text().replace("nds-caller-target", parent_name))
+        parent_lock = lock.replace(b"nds-caller-target", parent_name.encode())
+        (parent / "Cargo.lock").write_bytes(parent_lock)
+        sentinels.append(owned_directory(target))
+        if build != target:
+            sentinels.append(owned_directory(build))
+        proof = case / "child-artifacts.jsonl"
+        arguments = [str(config), "cargo", "test", "--locked", "--offline", "--lib", "--message-format=json",
+                     "--manifest-path", str(child / "Cargo.toml")]
+        if mode == "cli":
+            arguments += ["--target-dir", str(target)]
+        elif mode == "equals":
+            arguments += ["--target-dir=" + str(target)]
+        variable = "CARGO_TARGET_DIR" if mode in ("env", "independent-build") else "CARGO_BUILD_TARGET_DIR"
+        placement = (f'.env({json.dumps(variable)},{json.dumps(str(target))})'
+                     if mode in ("env", "alias", "independent-build") else "")
+        build_choice = (json.dumps(str(build)) if mode == "independent-build"
+                        else 'std::env::var_os("NDS_CLEANER_MANAGED_BUILD_DIR").unwrap()')
+        (parent / "build.rs").write_text(
+            'fn main(){let output=std::process::Command::new(' + json.dumps(str(binary)) + ').args(['
+            + ','.join(json.dumps(arg) for arg in arguments) + ']).current_dir(' + json.dumps(str(child)) + ')'
+            + placement + '.env("CARGO_HOME",' + json.dumps(str(home)) + ')'
+            + '.env("CARGO_BUILD_BUILD_DIR",' + build_choice + ')'
+            + '.output().unwrap();assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));'
+            + 'std::fs::write(' + json.dumps(str(proof)) + ',output.stdout).unwrap();}\n'
+        )
+        run("cargo", "build", "--locked", "--offline", cwd=parent, overrides={"CARGO_HOME": str(home)})
+        test = artifact(proof.read_text(), "nds_caller_target")
+        assert not test["fresh"] and Path(test["executable"]).is_relative_to(build)
+        assert (parent / "Cargo.lock").read_bytes() == parent_lock
+        assert (child / "Cargo.lock").read_bytes() == lock
+
+    # A caller may select an actual known managed target in another lane, also
+    # as its explicit build-dir: retention follows namespace, not argument role.
+    lane = hashlib.sha256(b"owned caller-target acceptance lane").hexdigest()
+    workspace = hashlib.sha256(b"owned caller-target acceptance workspace").hexdigest()
+    managed = root / "cargo/lanes" / lane / "targets" / workspace / "cache"
+    metadata = json.loads(run("cargo", "metadata", "--locked", "--offline", "--no-deps", "--format-version", "1",
+                              cwd=second, overrides={"CARGO_HOME": str(home), "CARGO_TARGET_DIR": str(managed),
+                                                     "CARGO_BUILD_BUILD_DIR": str(managed)}))
+    assert Path(metadata["target_directory"]) == Path(metadata["build_directory"]) == managed
+    assert int((managed.parent / ".last-use").read_text()) > 0
+    assert (managed.parent / ".pending-use").read_bytes() == b"1"
+    assert (managed.parents[2] / ".lease").is_file()
+    lease_project = base / "caller-lease"
+    project(lease_project)
+    lease_probe = '''import fcntl, sys
+with open(sys.argv[1], "r+") as stream:
+    try:
+        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        raise AssertionError("actual selected lane lease was not inherited")
+'''
+    (lease_project / "build.rs").write_text(
+        'fn main(){assert!(std::process::Command::new(' + json.dumps(sys.executable) + ').args(['
+        + ','.join(json.dumps(arg) for arg in ("-c", lease_probe, str(managed.parents[2] / ".lease")))
+        + ']).status().unwrap().success());}\n'
+    )
+    run("cargo", "build", "--locked", "--offline", "--target-dir", str(managed), cwd=lease_project,
+        overrides={"CARGO_HOME": str(home), "CARGO_BUILD_BUILD_DIR": str(managed)})
+    assert (lease_project / "Cargo.lock").read_bytes() == lock
+
+    forwarded = run("cargo", "run", "--locked", "--offline", "--bin", "caller-placement",
+                    "--message-format=json", "--", "--target-dir", "literal", cwd=second,
+                    overrides={"CARGO_HOME": str(home)})
+    assert "argv preserved" in forwarded.splitlines()
+    executable = Path(artifact(forwarded, "caller-placement")["executable"])
+    assert executable.is_relative_to(root / "cargo/lanes") and "targets" in executable.parts
+
+    # Compare actual native errors rather than replacing malformed argv with a
+    # frontend-specific configuration refusal. These commands cannot compile.
+    control_env = dict(environment, CARGO_HOME=str(home), RUSTC=str(rustc), RUSTDOC=str(rustdoc))
+    for options in (("--target-dir",), ("--target-dir", str(base / "invalid target"), "--nds-invalid-target-option")):
+        errors = []
+        for command in ([tools / "cargo", "test", "--locked", "--offline", *options],
+                        [binary, config, "cargo", "test", "--locked", "--offline", *options]):
+            try:
+                call(command, cwd=second, environment=control_env)
+            except RuntimeError as error:
+                errors.append(str(error))
+            else:
+                raise AssertionError("invalid native target argument unexpectedly succeeded")
+        assert errors[0] == errors[1] and "NDS Cleaner:" not in errors[1]
+    assert sentinel.read_bytes() == b"preserved caller source home"
+    assert all(path.read_bytes() == b"caller-owned placement" for path in sentinels[1:])
+    return {"relocation": proofs, "nested_explicit_target_modes": list(nested_modes),
+            "known_managed_target_and_build_namespace": True, "native_errors_and_forwarded_argv": True,
+            "caller_home_sentinel_sha256": hashlib.sha256(sentinel.read_bytes()).hexdigest(),
+            "config_parity": "not qualified: hierarchical config and later CLI config remain separate gaps"}
+
+
+def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False):
     versions = json.loads((REPO / "cache-providers.lock.json").read_text())["versions"]
-    for name, expected in versions.items():
+    for name, expected in ({"cargo": versions["cargo"]} if caller_targets_only else versions).items():
         reported = call([tools / name, "--version"]).strip()
         assert (reported.split(" (")[0] if name == "uv" else reported) == expected
     with tempfile.TemporaryDirectory(prefix="nds-cache-acceptance-") as temporary:
@@ -68,6 +278,9 @@ def qualify(binary, tools, rustc, rustdoc):
             return call([binary, config, tool, *args], cwd=cwd, environment=dict(fixture_env, **(overrides or {})))
         run("init")
         assert run("cargo", "+1.99.1", "--version").strip() == versions["cargo"]
+        if caller_targets_only:
+            return qualify_caller_targets(run, base, root, binary=binary, config=config, tools=tools,
+                                          rustc=rustc, rustdoc=rustdoc, environment=fixture_env)
         packages = tomllib.loads((REPO / "Cargo.lock").read_text())["package"]
         pins = {name: next(item["version"] for item in packages if item["name"] == name)
                 for name in ("itoa", "memchr")}
@@ -145,6 +358,8 @@ def qualify(binary, tools, rustc, rustdoc):
         assert Path(metadata["build_directory"])==external_build
         assert next(item for item in metadata["packages"] if item["name"]=="itoa")["manifest_path"].startswith(str(provider_home))
         run("cargo","build",cwd=apps[1],overrides=overrides)
+        caller_targets = qualify_caller_targets(run, base, root, binary=binary, config=config, tools=tools,
+                                               rustc=rustc, rustdoc=rustdoc, environment=fixture_env)
         # Distinct manifests called from the same directory cannot collide.
         targets=[]
         for app in apps:
@@ -225,7 +440,8 @@ def qualify(binary, tools, rustc, rustdoc):
         assert call([python / ".venv/bin/python", "-c", "import idna,sys;print(sys.version_info[:3])"]).strip() == "(3, 15, 1)"
         assert call([tools / "bun", "-e", 'console.log(require("is-number")(7))'], cwd=javascript).strip() == "true"
         return {"cargo_cross_project_warm_hit": True, "rustup_cargo_routing": bool(rustup), "separate_final_binaries": True,
-                "caller_owned_inputs_preserved": True, "manifest_target_isolation": True, "native_and_wrapped_nested_builds": True,
+                "caller_owned_inputs_preserved": True, "caller_targets": caller_targets,
+                "manifest_target_isolation": True, "native_and_wrapped_nested_builds": True,
                 "warm_use_refreshes_native_stamp": True, "stale_artifact_gc": True,
                 "native_source_gc": True, "native_child_lease_survives_parent": True,
                 "uv_bun_idle_generation_gc": True, "installed_environments_preserved": True,
@@ -238,5 +454,8 @@ if __name__ == "__main__":
     parser.add_argument("--tools", type=Path, required=True)
     parser.add_argument("--rustc", type=Path, required=True)
     parser.add_argument("--rustdoc", type=Path, required=True)
+    parser.add_argument("--caller-targets-only", action="store_true",
+                        help="run only real offline Cargo caller-target qualification in the owned fixture")
     args = parser.parse_args()
-    print(json.dumps(qualify(args.binary.resolve(), args.tools.resolve(), args.rustc.resolve(), args.rustdoc.resolve())))
+    print(json.dumps(qualify(args.binary.resolve(), args.tools.resolve(), args.rustc.resolve(), args.rustdoc.resolve(),
+                             caller_targets_only=args.caller_targets_only)))
