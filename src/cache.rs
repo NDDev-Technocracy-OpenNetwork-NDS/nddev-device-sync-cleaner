@@ -13,6 +13,7 @@ use std::{
     fs,
     io::{self, Read, Write},
     os::unix::{
+        ffi::OsStringExt,
         fs::{DirBuilderExt, MetadataExt, PermissionsExt},
         process::CommandExt,
     },
@@ -428,7 +429,7 @@ impl ManagedCache {
     }
     // Caller-owned staging is preserved. Recognized paths inside our own pool
     // additionally retain their actual lane lease and completed-use record.
-    fn retain_managed_path(&self, path: &Path, kind: &str) -> Result<Option<fs::File>> {
+    fn retain_managed_path(&self, path: &Path) -> Result<Option<fs::File>> {
         let prefix = self.config.root.join("cargo/lanes");
         let Ok(relative) = path.strip_prefix(prefix) else {
             return Ok(None);
@@ -436,7 +437,7 @@ impl ManagedCache {
         let parts: Vec<_> = relative.components().map(|part| part.as_os_str()).collect();
         if parts.len() < 2
             || !parts[0].to_str().is_some_and(|s| hash_name(s, 64))
-            || parts[1] != kind
+            || (parts[1] != "build" && parts[1] != "targets")
         {
             return Err(CacheError::Ownership);
         }
@@ -448,7 +449,7 @@ impl ManagedCache {
         }
         let lane = prepare(&self.root, &Path::new("cargo/lanes").join(parts[0]))?;
         let guard = lease(&lane, false, true)?;
-        if kind == "targets" {
+        if parts[1] == "targets" {
             if parts.len() != 4
                 || parts[3] != "cache"
                 || !parts[2].to_str().is_some_and(|s| hash_name(s, 64))
@@ -564,11 +565,38 @@ impl ManagedCache {
         let lane = prepare(&self.root, &lane_path)?;
         let _lease = lease(&lane, false, true)?;
         let inherited_build = std::env::var_os("CARGO_BUILD_BUILD_DIR");
-        let inherited_target = std::env::var_os("CARGO_TARGET_DIR")
+        let special_target = std::env::var_os("CARGO_TARGET_DIR");
+        let inherited_target = special_target
+            .clone()
             .or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR"));
         let parent_build = std::env::var_os("NDS_CLEANER_MANAGED_BUILD_DIR");
-        let nested = parent_build.is_some()
+        let parent_target = std::env::var_os("NDS_CLEANER_MANAGED_TARGET_DIR");
+        // Only recognize dedicated native options, without interpreting Cargo
+        // configuration, aliases or arguments forwarded after `--`.
+        let mut arguments = args.iter().take_while(|arg| arg.as_os_str() != "--");
+        let mut cli_target = None;
+        let mut has_cli_target = false;
+        let mut has_cli_config = false;
+        while let Some(argument) = arguments.next() {
+            if argument == "--target-dir" {
+                has_cli_target = true;
+                cli_target = arguments.next().cloned();
+            } else if let Some(value) = argument.as_encoded_bytes().strip_prefix(b"--target-dir=") {
+                has_cli_target = true;
+                cli_target = Some(OsString::from_vec(value.to_vec()));
+            } else if argument == "--config" {
+                has_cli_config = true;
+                let _ = arguments.next();
+            } else if argument.as_encoded_bytes().starts_with(b"--config=") {
+                has_cli_config = true;
+            }
+        }
+        let inherited_defaults = parent_build.is_some()
             && (inherited_build.is_none() || inherited_build == parent_build);
+        let caller_target = has_cli_target
+            || (inherited_target.is_some()
+                && !(inherited_defaults && inherited_target == parent_target));
+        let nested = inherited_defaults && !caller_target;
         let depth = if nested {
             std::env::var("NDS_CLEANER_NESTING")
                 .unwrap_or_else(|_| "0".into())
@@ -600,11 +628,7 @@ impl ManagedCache {
         workspace_identity.push(depth);
         let workspace = digest(&workspace_identity);
         let target_path = lane_path.join("targets").join(&workspace);
-        let target = prepare(&self.root, &target_path)?;
-        use_cache(&target)?;
         directory(&self.root, Path::new("cargo/home"))?;
-        lane.create_dir_all("build")?;
-        target.create_dir_all("cache")?;
         let root = &self.config.root;
         let managed_build = if depth == 0 {
             root.join(&lane_path).join("build")
@@ -615,21 +639,45 @@ impl ManagedCache {
                 .join(&workspace)
         };
         let managed_target = root.join(&target_path).join("cache");
-        let default_build = nested || inherited_build.is_none();
-        let default_target = inherited_target.is_none()
-            || (nested && inherited_target == std::env::var_os("NDS_CLEANER_MANAGED_TARGET_DIR"));
-        let actual_build = if default_build {
-            managed_build.as_os_str().to_owned()
+        let default_build = !caller_target && (nested || inherited_build.is_none());
+        let default_target = !caller_target;
+        let clear_parent_build = caller_target && inherited_defaults && inherited_build.is_some();
+        // With caller placement, omit our build-dir default altogether. Cargo
+        // chooses an independent configured build-dir, or defaults to its actual
+        // selected target; neither choice can be inferred from the target alone.
+        let known_build = if has_cli_config || clear_parent_build {
+            None
+        } else if default_build {
+            Some(managed_build.as_os_str().to_owned())
         } else {
-            inherited_build.unwrap_or_else(|| managed_build.as_os_str().to_owned())
+            inherited_build
         };
-        let actual_target = if default_target {
-            managed_target.as_os_str().to_owned()
+        let known_target = if has_cli_target {
+            cli_target
+        } else if special_target.is_some() && !default_target {
+            special_target
+        } else if has_cli_config {
+            None
+        } else if default_target {
+            Some(managed_target.as_os_str().to_owned())
         } else {
-            inherited_target.unwrap_or_else(|| managed_target.as_os_str().to_owned())
+            inherited_target
         };
-        let _build_lease = self.retain_managed_path(Path::new(&actual_build), "build")?;
-        let _target_lease = self.retain_managed_path(Path::new(&actual_target), "targets")?;
+        // Config-file origins/templates and later CLI config remain a separate
+        // parity gap. Do not stamp hypothetical default paths as actual use.
+        let _build_lease = known_build
+            .as_deref()
+            .filter(|path| !path.as_encoded_bytes().contains(&b'{'))
+            .map(|path| self.retain_managed_path(Path::new(path)))
+            .transpose()?;
+        let _target_lease = known_target
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .map(|path| self.retain_managed_path(Path::new(path)))
+            .transpose()?;
+        if default_build {
+            lane.create_dir_all("build")?;
+        }
         let source_home =
             std::env::var_os("CARGO_HOME").unwrap_or(self.cargo_home()?.into_os_string());
         let compiler_bin = rustc.parent().ok_or(CacheError::Provider)?;
@@ -654,14 +702,6 @@ impl ManagedCache {
         }
         let mut env = vec![
             ("CARGO_HOME".into(), source_home),
-            (
-                "NDS_CLEANER_MANAGED_BUILD_DIR".into(),
-                managed_build.into_os_string(),
-            ),
-            (
-                "NDS_CLEANER_MANAGED_TARGET_DIR".into(),
-                managed_target.into_os_string(),
-            ),
             ("NDS_CLEANER_NESTING".into(), depth.to_string().into()),
             ("CARGO_UNSTABLE_MTIME_ON_USE".into(), "true".into()),
             ("CARGO_UNSTABLE_FINE_GRAIN_LOCKING".into(), "true".into()),
@@ -686,8 +726,8 @@ impl ManagedCache {
         // Invocation-local configuration avoids propagating generated final-
         // output locks to native Cargo invoked directly by build scripts.
         for (default, key, path) in [
-            (default_build, "build.build-dir", &actual_build),
-            (default_target, "build.target-dir", &actual_target),
+            (default_build, "build.build-dir", &managed_build),
+            (default_target, "build.target-dir", &managed_target),
         ] {
             if default {
                 native_args.push("--config".into());
@@ -703,7 +743,28 @@ impl ManagedCache {
         }
         native_args.extend_from_slice(args);
         let mut command = self.command(&self.config.cargo, env, &native_args);
-        if default_build {
+        // Generated-default hints carry recursion context, not proof of the
+        // effective paths after caller configuration. Keep that context even
+        // with CLI config; only known_* above governs additional path retention.
+        for (key, generated_default, path) in [
+            (
+                "NDS_CLEANER_MANAGED_BUILD_DIR",
+                default_build,
+                &managed_build,
+            ),
+            (
+                "NDS_CLEANER_MANAGED_TARGET_DIR",
+                default_target,
+                &managed_target,
+            ),
+        ] {
+            if generated_default {
+                command.env(key, path);
+            } else {
+                command.env_remove(key);
+            }
+        }
+        if default_build || clear_parent_build {
             command.env_remove("CARGO_BUILD_BUILD_DIR");
         }
         if default_target {
