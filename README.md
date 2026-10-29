@@ -65,9 +65,14 @@ nds-cleaner-cache /operator/config/cache.json clean --apply
 ```
 
 `clean` defaults to preview. JSON reports distinguish stale/removed native units,
-native GC calls, active leases and completed-use observations. A bounded failure
-is an error, never a fabricated successful cleanup. Scheduling and device paths
-belong to the operator's estate. This CLI adds no remote mutation command.
+native GC calls, active leases and completed-use observations. Discovery keeps
+its entry and time limits, without charging native cleanup or use acknowledgments
+against traversal time. Native provider calls retain their own process deadline.
+Cargo incremental, dependency and example payload directories are retained without
+traversal and counted as unknown; collection inspects recognized native unit
+groups instead. A bounded failure is an error, never a fabricated successful
+cleanup. Scheduling and device paths belong to the operator's estate. This CLI
+adds no remote mutation command.
 Frozen release artifacts must be staged outside mutable caches.
 
 Run `just check` and `just provider-check` with the real `NDS_TEST_CLEANER` path.

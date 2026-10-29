@@ -860,6 +860,16 @@ impl Budget {
             Ok(())
         }
     }
+
+    // Bound discovery, not the work it discovers. Native providers have their
+    // own process deadline; deleting a qualified unit or acknowledging a use
+    // must not exhaust the next directory's traversal budget.
+    fn effect<T>(&mut self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let start = Instant::now();
+        let result = operation();
+        self.start += start.elapsed();
+        result
+    }
 }
 
 fn stamp(dir: &Dir) -> Result<Option<SystemTime>> {
@@ -917,6 +927,13 @@ fn artifact_units(
             report.unknown += 1;
             continue;
         };
+        // These contain native payloads, not the unit/fingerprint layout we
+        // collect. Incremental objects can vastly exceed the discovery limit.
+        // Retain these directories without walking their contents.
+        if matches!(name_str, "incremental" | "deps" | "examples") {
+            report.unknown += 1;
+            continue;
+        }
         let child = directory(dir, Path::new(&name))?;
         if name_str == "build" {
             for package in child.entries()? {
@@ -945,7 +962,7 @@ fn artifact_units(
                         if expired(seconds, current) {
                             report.stale_units += 1;
                             if apply {
-                                unit_dir.remove_open_dir_all()?;
+                                budget.effect(|| Ok(unit_dir.remove_open_dir_all()?))?;
                                 report.removed_units += 1;
                             }
                         }
@@ -1012,7 +1029,7 @@ impl ManagedCache {
                         continue;
                     }
                     let target = directory(&targets, Path::new(&name))?;
-                    if completed_use(&target, current, apply)? {
+                    if budget.effect(|| completed_use(&target, current, apply))? {
                         report.completed_uses += 1;
                         continue;
                     }
@@ -1020,7 +1037,7 @@ impl ManagedCache {
                         Ok(last) if expired(last, current) => {
                             report.stale_units += 1;
                             if apply {
-                                target.remove_open_dir_all()?;
+                                budget.effect(|| Ok(target.remove_open_dir_all()?))?;
                                 report.removed_units += 1;
                             }
                         }
@@ -1053,7 +1070,7 @@ impl ManagedCache {
                     }
                     Err(error) => return Err(error),
                 };
-                if completed_use(&shard, current, apply)? {
+                if budget.effect(|| completed_use(&shard, current, apply))? {
                     report.completed_uses += 1;
                     continue;
                 }
@@ -1072,7 +1089,7 @@ impl ManagedCache {
                     continue;
                 }
                 let executable = executable.ok_or(CacheError::Provider)?;
-                self.version(executable, &qualified(tool)?)?;
+                budget.effect(|| self.version(executable, &qualified(tool)?))?;
                 directory(&shard, Path::new("cache"))?;
                 let mut env = OsString::from(format!("{variable}="));
                 env.push(self.config.root.join(tool).join(&name).join("cache"));
@@ -1088,7 +1105,7 @@ impl ManagedCache {
                         "3".into(),
                     ]
                 });
-                self.native(Path::new("/usr/bin/env"), args, None)?;
+                budget.effect(|| self.native(Path::new("/usr/bin/env"), args, None))?;
                 report.native_cache_runs += 1;
                 // Keep ledger and native Bun store links. No raw cache tree removal.
             }
@@ -1316,6 +1333,59 @@ mod tests {
             start: Instant::now(),
         };
         assert!(matches!(budget.visit(), Err(CacheError::Budget)));
+        let mut budget = Budget {
+            entries: 0,
+            start: Instant::now() - Duration::from_secs(21),
+        };
+        assert!(matches!(budget.visit(), Err(CacheError::Budget)));
+    }
+    #[test]
+    fn native_payloads_do_not_starve_qualified_unit_collection() {
+        let (temp, _) = fixture();
+        let old = unit(temp.path(), "0123456789abcdef", RETENTION.as_secs() + 10);
+        let mut payloads = Vec::new();
+        for name in ["incremental", "deps", "examples"] {
+            let payload = temp.path().join("debug").join(name);
+            let nested = unit(&payload, "fedcba9876543210", RETENTION.as_secs() + 10);
+            for index in 0..32 {
+                fs::write(payload.join(format!("object-{index}")), b"keep").unwrap();
+            }
+            payloads.push((payload, nested));
+        }
+        let dir = Dir::open_ambient_dir(temp.path(), ambient_authority()).unwrap();
+        let mut report = Report::default();
+        artifact_units(
+            &dir,
+            0,
+            now().unwrap(),
+            true,
+            &mut report,
+            &mut Budget {
+                entries: MAX_ENTRIES - 16,
+                start: Instant::now(),
+            },
+        )
+        .unwrap();
+        assert_eq!(report.removed_units, 1);
+        assert_eq!(report.unknown, 3);
+        assert!(!old.exists());
+        for (payload, nested) in payloads {
+            assert!(nested.join("rebuildable.rlib").exists());
+            assert_eq!(fs::read(payload.join("object-31")).unwrap(), b"keep");
+        }
+    }
+    #[test]
+    fn effects_keep_their_errors_without_spending_discovery_time() {
+        let mut budget = Budget {
+            entries: 0,
+            start: Instant::now() - Duration::from_secs(19),
+        };
+        let result: Result<()> = budget.effect(|| {
+            std::thread::sleep(Duration::from_millis(1100));
+            Err(CacheError::Provider)
+        });
+        assert!(matches!(result, Err(CacheError::Provider)));
+        assert!(budget.visit().is_ok());
     }
     #[test]
     fn completion_observation_preserves_recent_long_running_work_and_preview_is_read_only() {
