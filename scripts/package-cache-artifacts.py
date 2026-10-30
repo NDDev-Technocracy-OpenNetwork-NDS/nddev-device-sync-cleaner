@@ -17,7 +17,7 @@ def stage(args):
     inputs = [args.execution, args.maintenance, args.frontend, args.tools, args.license]
     if any(path.is_symlink() or not path.is_file() for path in inputs):
         raise ValueError("native artifact inputs must be regular files")
-    for path, version in ((args.execution, "alpha.5"), (args.maintenance, "alpha.6")):
+    for path, version in ((args.execution, "alpha.5"), (args.maintenance, "alpha.7")):
         observed = subprocess.check_output([str(path.resolve()), "--version"], text=True, timeout=30)
         if observed.strip() != "nds-cleaner-cache 0.0.1-" + version:
             raise ValueError("native artifact version differs from its qualified role")
