@@ -68,8 +68,35 @@ jobs:
         shell: bash
         run: |
           python3 scripts/prepare-cache-tools.py "$RUNNER_TEMP/cache-owners"
-          cargo build --locked --bin nds-cleaner-cache
-          python3 scripts/check-cache-provider.py --binary target/debug/nds-cleaner-cache --tools "$RUNNER_TEMP/cache-owners/bin" --rustc "$(rustup which rustc)" --rustdoc "$(rustup which rustdoc)"
+          cargo build --locked --release --bin nds-cleaner-cache
+          python3 scripts/check-cache-provider.py --binary target/release/nds-cleaner-cache --tools "$RUNNER_TEMP/cache-owners/bin" --rustc "$(rustup which rustc)" --rustdoc "$(rustup which rustdoc)"
+      - name: Qualify and stage the compatible execution artifact
+        if: runner.os == 'Linux' || (runner.os == 'macOS' && runner.arch == 'ARM64')
+        shell: bash
+        run: |
+          set -euo pipefail
+          execution_source=935ba2639166d6ea368ecbab3a08d739271c3222
+          execution="$RUNNER_TEMP/nds-cache-execution-source"
+          git fetch --no-tags origin "$execution_source"
+          git worktree add --detach "$execution" "$execution_source"
+          cargo build --locked --release --manifest-path "$execution/Cargo.toml" --bin nds-cleaner-cache
+          python3 "$execution/scripts/check-cache-provider.py" --binary "$execution/target/release/nds-cleaner-cache" --tools "$RUNNER_TEMP/cache-owners/bin" --rustc "$(rustup which rustc)" --rustdoc "$(rustup which rustdoc)"
+          python3 scripts/package-cache-artifacts.py \
+            --execution "$execution/target/release/nds-cleaner-cache" --execution-source "$execution_source" \
+            --maintenance target/release/nds-cleaner-cache --maintenance-source "$(git rev-parse HEAD)" \
+            --frontend "$execution/scripts/install-cache-frontends.py" --license LICENSE \
+            --tools "$RUNNER_TEMP/cache-owners/source.json" --rustc "$(rustup which rustc)" \
+            --output "$RUNNER_TEMP/nds-cache-native-artifacts"
+          tar -czf "$RUNNER_TEMP/nds-cache-native.tar.gz" -C "$RUNNER_TEMP/nds-cache-native-artifacts" .
+      - name: Retain qualified native execution and maintenance artifacts
+        if: success() && (runner.os == 'Linux' || (runner.os == 'macOS' && runner.arch == 'ARM64'))
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nds-cache-native-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ runner.temp }}/nds-cache-native.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
       - name: Fetch verified native provider
         if: runner.os == 'Linux'
         env:
