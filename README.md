@@ -17,6 +17,16 @@ homes and final/intermediate staging paths are honored. Invocation-local cache
 configuration and nested wrapper scopes avoid inheriting a parent final-output
 lock into build-script Cargo calls. Explicit staging outside managed roots stays
 with its caller. Existing project lockfiles keep their owner.
+`cargo clippy ...` and `cargo nextest ...` commands enter their native
+tools with the managed Cargo frontend. Their Cargo children retain the same
+scope; build-script recursion still receives a separate nesting scope. Clippy
+uses the selected compiler's installed component; Nextest uses the existing
+native command lookup. Native global offline/lock/config/color/verbosity and
+`-Z` options before those commands are forwarded. These routes require
+installed cache frontends.
+Caller `--config` entries before or after a Cargo command share one native
+matcher with generated defaults and retain their override order. Arguments
+after `--` are forwarded unchanged.
 
 Cleanup retains active shared leases, including native children surviving Cargo's
 exit. An exclusive lease permits removal only of known native unit groups whose
@@ -26,9 +36,16 @@ symlink traversal. Cargo's native `clean gc -Zgc` owns source/archive/index/Git
 cleanup with all five age limits set to three days. An optional existing native
 Cargo home keeps its own credentials, installed programs and native cache locks.
 
-uv and Bun cache generations are identified by workspace, exact lock content and
-command arguments; unlocked operations use daily generations. Arguments are
-hashed, never journaled. Each generation has an inherited lease. Cleanup observes
+uv and Bun generation v2 is identified by the qualified provider version,
+OS/architecture, canonical workspace and exact nearest `uv.lock` or `bun.lock`.
+Offline/presentation flags and other command argv do not create a new store;
+native uv/Bun own package, interpreter/ABI and index compatibility inside it.
+Native directory/project selectors and uv's corresponding environment select
+the workspace; selectors after `--` belong to the called program. Unlocked
+operations use daily generations. Arguments and lock content are never
+journaled. Old v1 generations keep their own leases/use records and age out
+normally; no cache copies, timestamp rewriting or installed-environment migration
+is performed. Each generation has an inherited lease. Cleanup observes
 completed foreground use under an exclusive lease before starting its three-day
 idle period, so a long-running command cannot become immediately stale on exit.
 A regular hourly maintenance pass bounds this conservative observation delay.

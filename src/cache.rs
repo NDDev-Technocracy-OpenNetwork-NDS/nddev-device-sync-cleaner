@@ -319,6 +319,124 @@ fn fallback_toolchain(cwd: &Path, release: &str, host: &str) -> Result<()> {
     Ok(())
 }
 
+fn tool_generation(tool: &str, cwd: &Path, args: &[OsString], current: u64) -> Result<String> {
+    let mut working = if tool == "uv" {
+        std::env::var_os("UV_WORKING_DIR").map(PathBuf::from)
+    } else {
+        None
+    };
+    let mut project = if tool == "uv" {
+        std::env::var_os("UV_PROJECT").map(PathBuf::from)
+    } else {
+        None
+    };
+    let mut arguments = args.iter().take_while(|arg| arg.as_os_str() != "--");
+    while let Some(argument) = arguments.next() {
+        let options: &[&str] = if tool == "uv" {
+            &["--directory", "--project"]
+        } else {
+            &["--cwd"]
+        };
+        for &option in options {
+            let destination = if option == "--project" {
+                &mut project
+            } else {
+                &mut working
+            };
+            if argument == option {
+                *destination = Some(PathBuf::from(
+                    arguments.next().ok_or(CacheError::Configuration)?,
+                ));
+                break;
+            }
+            let prefix = format!("{option}=");
+            if let Some(value) = argument.as_encoded_bytes().strip_prefix(prefix.as_bytes()) {
+                *destination = Some(PathBuf::from(OsString::from_vec(value.to_vec())));
+                break;
+            }
+        }
+    }
+    let working = fs::canonicalize(cwd.join(working.unwrap_or_default()))?;
+    let selected = fs::canonicalize(working.join(project.unwrap_or_default()))?;
+    let lock = if tool == "uv" { "uv.lock" } else { "bun.lock" };
+    let mut workspace = selected.clone();
+    let mut locked = None;
+    for parent in selected.ancestors().take(64) {
+        let path = parent.join(lock);
+        // Source lockfiles are read-only caller inputs; native projects may
+        // legitimately symlink them. Cache control files still reject links.
+        match fs::metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+            Ok(meta) if !meta.is_file() => {
+                return Err(CacheError::Configuration);
+            }
+            Ok(_) => {}
+        }
+        let mut content = Vec::new();
+        fs::File::open(path)?
+            .take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut content)?;
+        if content.len() > 16 * 1024 * 1024 {
+            return Err(CacheError::Configuration);
+        }
+        workspace = parent.to_owned();
+        locked = Some(content);
+        break;
+    }
+    // v2 is a separate namespace: never copy/adopt a v1 payload or alter its
+    // lease or last-use markers. Native providers own package/ABI/index keys;
+    // presentation, offline mode and command argv are not compatibility keys.
+    let mut identity = b"NDS native tool cache generation v2\0".to_vec();
+    for part in [
+        tool.as_bytes(),
+        qualified(tool)?.as_bytes(),
+        std::env::consts::OS.as_bytes(),
+        std::env::consts::ARCH.as_bytes(),
+        workspace.as_os_str().as_encoded_bytes(),
+    ] {
+        identity.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        identity.extend_from_slice(part);
+    }
+    match locked {
+        Some(content) => {
+            identity.push(1);
+            identity.extend(content);
+        }
+        None => {
+            identity.push(0);
+            identity.extend_from_slice(&(current / 86400).to_le_bytes());
+        }
+    }
+    Ok(digest(&identity))
+}
+
+fn external_command(args: &[OsString]) -> Option<(usize, &str)> {
+    let mut index = 0;
+    while let Some(argument) = args.get(index)?.to_str() {
+        match argument {
+            "clippy" | "nextest" => return Some((index, argument)),
+            "--config" | "--color" | "-Z" => {
+                args.get(index + 1)?;
+                index += 2;
+            }
+            "--offline" | "--locked" | "--frozen" | "--quiet" | "--verbose" => index += 1,
+            value
+                if value.starts_with("--config=")
+                    || value.starts_with("--color=")
+                    || (value.starts_with("-Z") && value.len() > 2)
+                    || (value.starts_with('-')
+                        && value.len() > 1
+                        && value[1..].bytes().all(|b| matches!(b, b'v' | b'q'))) =>
+            {
+                index += 1
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 impl ManagedCache {
     pub fn initialize(config: Config) -> Result<Self> {
         if !config.root.exists() {
@@ -597,12 +715,14 @@ impl ManagedCache {
             || (inherited_target.is_some()
                 && !(inherited_defaults && inherited_target == parent_target));
         let nested = inherited_defaults && !caller_target;
+        let delegated =
+            std::env::var_os("NDS_CLEANER_EXTERNAL").as_deref() == Some(std::ffi::OsStr::new("1"));
         let depth = if nested {
             std::env::var("NDS_CLEANER_NESTING")
                 .unwrap_or_else(|_| "0".into())
                 .parse::<u8>()
                 .map_err(|_| CacheError::Configuration)?
-                .checked_add(1)
+                .checked_add(u8::from(!delegated))
                 .ok_or(CacheError::Configuration)?
         } else {
             0
@@ -663,8 +783,8 @@ impl ManagedCache {
         } else {
             inherited_target
         };
-        // Config-file origins/templates and later CLI config remain a separate
-        // parity gap. Do not stamp hypothetical default paths as actual use.
+        // Config-file origins/templates remain conservative. Do not stamp
+        // hypothetical default paths as actual use after caller configuration.
         let _build_lease = known_build
             .as_deref()
             .filter(|path| !path.as_encoded_bytes().contains(&b'{'))
@@ -681,6 +801,22 @@ impl ManagedCache {
         let source_home =
             std::env::var_os("CARGO_HOME").unwrap_or(self.cargo_home()?.into_os_string());
         let compiler_bin = rustc.parent().ok_or(CacheError::Provider)?;
+        let external_command = external_command(args);
+        let external = match external_command.map(|(_, name)| name) {
+            Some("clippy") => Some(compiler_bin.join("cargo-clippy")),
+            Some("nextest") => {
+                let bin = Path::new(&source_home).join("bin");
+                let paths: Vec<_> =
+                    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+                let candidate = bin.join("cargo-nextest");
+                if !paths.contains(&bin) && candidate.is_file() {
+                    Some(candidate)
+                } else {
+                    Some(executable("cargo-nextest".into(), &cwd)?)
+                }
+            }
+            _ => None,
+        };
         let path = std::env::join_paths(
             self.config
                 .frontends
@@ -709,6 +845,9 @@ impl ManagedCache {
             ("RUSTDOC".into(), rustdoc.into_os_string()),
             ("PATH".into(), path),
         ];
+        if external.is_some() && frontend.is_none() {
+            return Err(CacheError::Configuration);
+        }
         if let Some(frontend) = frontend {
             env.push(("CARGO".into(), frontend.into_os_string()));
         }
@@ -741,8 +880,54 @@ impl ManagedCache {
                 );
             }
         }
-        native_args.extend_from_slice(args);
-        let mut command = self.command(&self.config.cargo, env, &native_args);
+        // Cargo has separate root/subcommand config matchers. A caller's
+        // post-command --config can otherwise hide all generated root defaults.
+        // Keep every config in one matcher, preserving caller override order.
+        let mut remaining = Vec::new();
+        let mut arguments = args.iter();
+        while let Some(argument) = arguments.next() {
+            if argument == "--" {
+                remaining.push(argument.clone());
+                remaining.extend(arguments.cloned());
+                break;
+            }
+            if argument == "--config" {
+                native_args.push(argument.clone());
+                native_args.push(arguments.next().ok_or(CacheError::Configuration)?.clone());
+            } else if argument.as_encoded_bytes().starts_with(b"--config=") {
+                native_args.push(argument.clone());
+            } else {
+                remaining.push(argument.clone());
+            }
+        }
+        native_args.extend(remaining);
+        // Cargo rewrites CARGO for external commands and drops invocation-local
+        // config. Dispatch these qualified consumers with the frontend instead;
+        // their Cargo children re-enter the same scope, without exporting final-
+        // output paths into build scripts or acquiring another nesting level.
+        let is_external = external.is_some();
+        let mut command = if let Some(executable) = external {
+            let (index, name) = external_command.ok_or(CacheError::Configuration)?;
+            let mut forwarded = vec![args[index].clone()];
+            let mut rest = &args[index + 1..];
+            if name == "nextest"
+                && rest
+                    .first()
+                    .is_some_and(|arg| arg == "run" || arg == "list")
+            {
+                forwarded.push(rest[0].clone());
+                rest = &rest[1..];
+            }
+            forwarded.extend_from_slice(&args[..index]);
+            forwarded.extend_from_slice(rest);
+            self.command(&executable, env, &forwarded)
+        } else {
+            self.command(&self.config.cargo, env, &native_args)
+        };
+        command.env_remove("NDS_CLEANER_EXTERNAL");
+        if is_external {
+            command.env("NDS_CLEANER_EXTERNAL", "1");
+        }
         // Generated-default hints carry recursion context, not proof of the
         // effective paths after caller configuration. Keep that context even
         // with CLI config; only known_* above governs additional path retention.
@@ -776,17 +961,14 @@ impl ManagedCache {
     }
 
     pub fn run_tool(&self, tool: &str, args: &[OsString]) -> Result<()> {
-        let (executable, variable, lock) = match tool {
-            "uv" => (self.config.uv.as_ref(), "UV_CACHE_DIR", "uv.lock"),
-            "bun" => (
-                self.config.bun.as_ref(),
-                "BUN_INSTALL_CACHE_DIR",
-                "bun.lock",
-            ),
+        let (executable, variable) = match tool {
+            "uv" => (self.config.uv.as_ref(), "UV_CACHE_DIR"),
+            "bun" => (self.config.bun.as_ref(), "BUN_INSTALL_CACHE_DIR"),
             _ => return Err(CacheError::Configuration),
         };
         if args
             .iter()
+            .take_while(|arg| arg.as_os_str() != "--")
             .any(|a| a == "cache" || a.to_str().is_some_and(|a| a.starts_with("--cache-dir")))
         {
             return Err(CacheError::Configuration);
@@ -794,24 +976,7 @@ impl ManagedCache {
         let executable = executable.ok_or(CacheError::Provider)?;
         self.version(executable, &qualified(tool)?)?;
         let cwd = fs::canonicalize(std::env::current_dir()?)?;
-        // Exact lock content creates a reusable immutable dependency generation.
-        // Unlocked operations get a daily generation; arguments are never stored.
-        let mut identity = cwd.as_os_str().as_encoded_bytes().to_vec();
-        for argument in args {
-            identity.push(0);
-            identity.extend(argument.as_encoded_bytes());
-        }
-        let lock_path = cwd.join(lock);
-        if lock_path.is_file() {
-            let file = fs::File::open(lock_path)?;
-            if file.metadata()?.len() > 16 * 1024 * 1024 {
-                return Err(CacheError::Configuration);
-            }
-            file.take(16 * 1024 * 1024 + 1).read_to_end(&mut identity)?;
-        } else {
-            identity.extend_from_slice(&(now()? / 86400).to_le_bytes());
-        }
-        let shard_path = Path::new(tool).join(digest(&identity));
+        let shard_path = Path::new(tool).join(tool_generation(tool, &cwd, args, now()?)?);
         let shard = prepare(&self.root, &shard_path)?;
         let _lease = lease(&shard, false, true)?;
         use_cache(&shard)?;
@@ -1052,6 +1217,7 @@ impl ManagedCache {
             ("bun", self.config.bun.as_ref(), "BUN_INSTALL_CACHE_DIR"),
         ] {
             let shards = directory(&self.root, Path::new(tool))?;
+            let mut provider_qualified = false;
             for entry in shards.entries()? {
                 budget.visit()?;
                 let entry = entry?;
@@ -1089,7 +1255,10 @@ impl ManagedCache {
                     continue;
                 }
                 let executable = executable.ok_or(CacheError::Provider)?;
-                budget.effect(|| self.version(executable, &qualified(tool)?))?;
+                if !provider_qualified {
+                    budget.effect(|| self.version(executable, &qualified(tool)?))?;
+                    provider_qualified = true;
+                }
                 directory(&shard, Path::new("cache"))?;
                 let mut env = OsString::from(format!("{variable}="));
                 env.push(self.config.root.join(tool).join(&name).join("cache"));
@@ -1201,6 +1370,68 @@ mod tests {
         assert!(!expired(100, 100 + RETENTION.as_secs()));
         assert!(expired(100, 101 + RETENTION.as_secs()));
         assert!(!expired(100, 99));
+    }
+    #[test]
+    fn locked_generation_reuses_flags_and_member_directory_but_isolates_lock_changes() {
+        let (temp, _) = fixture();
+        let workspace = temp.path().join("project");
+        fs::create_dir_all(workspace.join("member")).unwrap();
+        fs::write(workspace.join("uv.lock"), b"version = 1\n").unwrap();
+        let scope = [
+            "--directory".into(),
+            workspace.as_os_str().to_owned(),
+            "--project".into(),
+            workspace.as_os_str().to_owned(),
+        ];
+        let mut args = scope.to_vec();
+        args.extend(["sync".into(), "--locked".into()]);
+        let first = tool_generation("uv", temp.path(), &args, 86400).unwrap();
+        args.extend(["--offline".into(), "--no-progress".into()]);
+        assert_eq!(
+            first,
+            tool_generation("uv", temp.path(), &args, 86400 * 10).unwrap()
+        );
+        args[1] = workspace.join("member").into_os_string();
+        args[3] = workspace.join("member").into_os_string();
+        assert_eq!(
+            first,
+            tool_generation("uv", temp.path(), &args, 86400).unwrap()
+        );
+        fs::write(workspace.join("uv.lock"), b"version = 2\n").unwrap();
+        assert_ne!(
+            first,
+            tool_generation("uv", temp.path(), &args, 86400).unwrap()
+        );
+        symlink(workspace.join("uv.lock"), workspace.join("member/uv.lock")).unwrap();
+        assert!(tool_generation("uv", temp.path(), &args, 86400).is_ok());
+    }
+    #[test]
+    fn unlocked_generation_rolls_daily_and_explicit_cwd_selects_native_lock() {
+        let (temp, _) = fixture();
+        let args = vec![
+            "--cwd".into(),
+            temp.path().as_os_str().to_owned(),
+            "install".into(),
+        ];
+        let first = tool_generation("bun", temp.path(), &args, 86400).unwrap();
+        assert_ne!(
+            first,
+            tool_generation("bun", temp.path(), &args, 86400 * 2).unwrap()
+        );
+        fs::write(temp.path().join("bun.lock"), b"{}\n").unwrap();
+        let locked = tool_generation("bun", temp.path(), &args, 86400).unwrap();
+        assert_ne!(first, locked);
+        let mut offline = args.clone();
+        offline.extend([
+            "--offline".into(),
+            "--".into(),
+            "--cwd".into(),
+            "not-a-directory".into(),
+        ]);
+        assert_eq!(
+            locked,
+            tool_generation("bun", temp.path(), &offline, 86400 * 2).unwrap()
+        );
     }
     #[test]
     fn initialization_refuses_foreign_contents() {
