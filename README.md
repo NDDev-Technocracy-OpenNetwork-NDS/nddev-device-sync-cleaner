@@ -75,6 +75,14 @@ configured, its `run TOOLCHAIN cargo ...` invocation also enters Cleaner with
 that compiler selection. Other Rustup operations delegate unchanged to the
 native backend. This covers SDK helpers that invoke Rustup directly.
 
+`retention_seconds` selects the operator's idle policy in whole native days,
+from 86400 through 31536000 seconds. For a one-day policy set it to `86400`.
+The same value governs known Cargo units, final targets, uv/Bun generations,
+all five native Cargo source-GC ages and Bun's native prune age. Reports return
+the effective value. An omitted setting retains the legacy three-day default.
+The boundary remains strict: equal-age, future-time, pending-use, busy and
+unknown objects are retained. Byte or free-space pressure never shortens it.
+
 ```sh
 nds-cleaner-cache /operator/config/cache.json init
 nds-cleaner-cache /operator/config/cache.json cargo test --locked

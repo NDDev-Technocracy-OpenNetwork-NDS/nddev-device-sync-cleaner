@@ -65,6 +65,13 @@ pub struct Config {
     pub uv: Option<PathBuf>,
     pub bun: Option<PathBuf>,
     pub scan_entries: Option<usize>,
+    pub retention_seconds: Option<u64>,
+}
+
+impl Config {
+    fn retention(&self) -> Duration {
+        Duration::from_secs(self.retention_seconds.unwrap_or(RETENTION.as_secs()))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -105,6 +112,9 @@ pub fn read_config(path: &Path) -> Result<Config> {
     file.take(16_385).read_to_end(&mut bytes)?;
     let config: Config = serde_json::from_slice(&bytes).map_err(|_| CacheError::Configuration)?;
     if config.schema != 1
+        || config.retention_seconds.is_some_and(|seconds| {
+            !(86_400..=365 * 86_400).contains(&seconds) || seconds % 86_400 != 0
+        })
         || config
             .scan_entries
             .is_some_and(|limit| limit == 0 || limit > MAX_ENTRIES)
@@ -142,10 +152,10 @@ fn now() -> Result<u64> {
         .map(|d| d.as_secs())
         .map_err(|_| CacheError::Configuration)
 }
-fn expired(last: u64, current: u64) -> bool {
+fn expired(last: u64, current: u64, retention: Duration) -> bool {
     current
         .checked_sub(last)
-        .is_some_and(|age| age > RETENTION.as_secs())
+        .is_some_and(|age| age > retention.as_secs())
 }
 fn hash_name(name: &str, length: usize) -> bool {
     name.len() == length
@@ -1072,6 +1082,7 @@ struct Progress {
 }
 struct Scan {
     budget: Budget,
+    retention: Duration,
     after: Option<ScanKey>,
     position: Option<ScanKey>,
 }
@@ -1079,6 +1090,7 @@ impl Scan {
     fn new(after: Option<ScanKey>) -> Self {
         Self {
             budget: Budget::new(),
+            retention: RETENTION,
             position: after.clone(),
             after,
         }
@@ -1282,7 +1294,7 @@ fn artifact_units(
                             .duration_since(UNIX_EPOCH)
                             .map_err(|_| CacheError::Ownership)?
                             .as_secs();
-                        if expired(seconds, current) {
+                        if expired(seconds, current, scan.retention) {
                             report.stale_units += 1;
                             if apply {
                                 scan.budget.effect(|| Ok(unit_dir.remove_open_dir_all()?))?;
@@ -1313,11 +1325,12 @@ impl ManagedCache {
         let mut report = Report {
             schema: 1,
             dry_run: !apply,
-            retention_seconds: RETENTION.as_secs(),
+            retention_seconds: self.config.retention().as_secs(),
             scan_complete: true,
             ..Report::default()
         };
         let mut scan = Scan::load(&self.root, apply)?;
+        scan.retention = self.config.retention();
         scan.budget.limit = self.config.scan_entries.unwrap_or(MAX_ENTRIES);
         report.resumed = scan.after.is_some();
         match self.collect_pass(apply, current, &mut report, &mut scan) {
@@ -1409,7 +1422,7 @@ impl ManagedCache {
                         continue;
                     }
                     match last_use(&target) {
-                        Ok(last) if expired(last, current) => {
+                        Ok(last) if expired(last, current, scan.retention) => {
                             report.stale_units += 1;
                             if apply {
                                 scan.budget.effect(|| Ok(target.remove_open_dir_all()?))?;
@@ -1477,7 +1490,7 @@ impl ManagedCache {
                         continue;
                     }
                 };
-                if !expired(last, current) {
+                if !expired(last, current, scan.retention) {
                     scan.note(&key);
                     continue;
                 }
@@ -1504,7 +1517,7 @@ impl ManagedCache {
                         "cache".into(),
                         "prune".into(),
                         "--max-age".into(),
-                        "3".into(),
+                        (scan.retention.as_secs() / 86_400).to_string().into(),
                     ]
                 });
                 scan.budget
@@ -1535,7 +1548,7 @@ impl ManagedCache {
             "--max-git-co-age",
             "--max-git-db-age",
         ] {
-            args.push(format!("{option}=3days").into());
+            args.push(format!("{option}={}days", scan.retention.as_secs() / 86_400).into());
         }
         if !apply {
             args.push("--dry-run".into());
@@ -1568,6 +1581,7 @@ mod tests {
                 uv: None,
                 bun: None,
                 scan_entries: None,
+                retention_seconds: None,
             },
         )
     }
@@ -1602,9 +1616,60 @@ mod tests {
     }
     #[test]
     fn retention_is_strict_and_clock_rollback_preserves() {
-        assert!(!expired(100, 100 + RETENTION.as_secs()));
-        assert!(expired(100, 101 + RETENTION.as_secs()));
-        assert!(!expired(100, 99));
+        assert!(!expired(100, 100 + RETENTION.as_secs(), RETENTION));
+        assert!(expired(100, 101 + RETENTION.as_secs(), RETENTION));
+        assert!(!expired(100, 99, RETENTION));
+        let one_day = Duration::from_secs(86_400);
+        assert!(!expired(100, 86_500, one_day));
+        assert!(expired(100, 86_501, one_day));
+        assert!(!expired(100, 99, one_day));
+    }
+    #[test]
+    fn configured_idle_policy_collects_only_qualified_older_units() {
+        let (temp, _) = fixture();
+        let old = unit(temp.path(), "0123456789abcdef", 2 * 86_400);
+        let recent = unit(temp.path(), "fedcba9876543210", 12 * 3600);
+        assert_eq!(scan(temp.path(), false).stale_units, 0);
+        let dir = Dir::open_ambient_dir(temp.path(), ambient_authority()).unwrap();
+        let mut cursor = Scan::new(None);
+        cursor.retention = Duration::from_secs(86_400);
+        let mut report = Report::default();
+        artifact_units(&dir, 0, now().unwrap(), true, &mut report, &mut cursor, &[]).unwrap();
+        assert_eq!(report.removed_units, 1);
+        assert!(!old.exists());
+        assert!(recent.exists());
+    }
+    #[test]
+    fn configured_retention_uses_whole_native_days_and_preserves_legacy_default() {
+        let (temp, config) = fixture();
+        let path = temp.path().join("config.json");
+        for seconds in [
+            None,
+            Some(0),
+            Some(3600),
+            Some(86_401),
+            Some(86_400),
+            Some(259_200),
+            Some(366 * 86_400),
+        ] {
+            let mut value = serde_json::json!({
+                "schema": 1, "root": config.root, "cargo": config.cargo,
+                "rustc": config.rustc, "rustdoc": config.rustdoc
+            });
+            if let Some(seconds) = seconds {
+                value["retention_seconds"] = seconds.into();
+            }
+            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let parsed = read_config(&path);
+            if seconds.is_none_or(|s| s == 86_400 || s == 259_200) {
+                assert_eq!(
+                    parsed.unwrap().retention().as_secs(),
+                    seconds.unwrap_or(RETENTION.as_secs())
+                );
+            } else {
+                assert!(matches!(parsed, Err(CacheError::Configuration)));
+            }
+        }
     }
     #[test]
     fn locked_generation_reuses_flags_and_member_directory_but_isolates_lock_changes() {

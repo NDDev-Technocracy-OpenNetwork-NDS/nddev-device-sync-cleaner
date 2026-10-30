@@ -420,6 +420,49 @@ def qualify_externals(run, base, root, *, environment):
             "project_target_absent": True, "lock_unchanged": True}
 
 
+def qualify_retention_policy(base, config, binary, environment):
+    """Exercise the one-day policy and native age arguments in a separate owned root."""
+    root = base / "one-day-cache"
+    path = base / "one-day-config.json"
+    settings = dict(json.loads(config.read_text()), root=str(root), frontends=None, cargo_home=None)
+    path.write_text(json.dumps(settings))
+
+    def run(operation, *arguments):
+        return call([binary, path, operation, *arguments], cwd=base, environment=environment)
+
+    run("init")
+    run("uv", "--version")
+    run("bun", "--version")
+    observed = json.loads(run("clean", "--apply"))
+    assert observed["retention_seconds"] == RETENTION and observed["completed_uses"] == 2
+    shards = [p for tool in ("uv", "bun") for p in (root / tool).iterdir()]
+    old = int(time.time()) - 2 * 86400
+    for shard in shards:
+        assert not (shard / ".pending-use").exists()
+        (shard / ".last-use").write_text(str(old))
+    legacy = json.loads(run("clean"))
+    assert legacy["stale_units"] == 0 and legacy["retention_seconds"] == RETENTION
+    settings["retention_seconds"] = 86400
+    path.write_text(json.dumps(settings))
+    preview = json.loads(run("clean"))
+    assert preview["stale_units"] == 2 and preview["retention_seconds"] == 86400
+    assert all((shard / ".last-use").read_text() == str(old) for shard in shards)
+    applied = json.loads(run("clean", "--apply", "--passes", "32"))
+    assert applied["scan_complete"]
+    report = applied["passes"][-1]
+    assert report["retention_seconds"] == 86400 and report["native_cache_runs"] == 3
+    run("uv", "--version")
+    recent = json.loads(run("clean", "--apply"))
+    assert recent["completed_uses"] == 1 and recent["stale_units"] == 1
+    for shard in shards:
+        (shard / ".last-use").write_text(str(int(time.time()) + 3600))
+    future = json.loads(run("clean"))
+    assert future["stale_units"] == 0
+    return {"configured_seconds": 86400, "legacy_default_preserved": True,
+            "completed_use_and_future_time_preserved": True, "preview_is_read_only": True,
+            "real_uv_bun_and_cargo_one_day_gc": True}
+
+
 def qualify_bounded_passes(run, base, root, config, binary, environment):
     # Interrupted preparation has no ownership lease yet. Retain it without
     # blocking unrelated maintenance or adopting its payload.
@@ -708,7 +751,8 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
         assert sum(after) < sum(before)
         assert call([python / ".venv/bin/python", "-c", "import idna,sys;print(sys.version_info[:3])"]).strip() == "(3, 15, 1)"
         assert call([tools / "bun", "-e", 'console.log(require("is-number")(7))'], cwd=javascript).strip() == "true"
-        return {"bounded_collection": bounded_passes,
+        configured_retention = qualify_retention_policy(base, config, binary, fixture_env)
+        return {"configured_retention": configured_retention, "bounded_collection": bounded_passes,
                 "external_subcommands": externals, "online_offline_tool_reuse": tool_reuse,
                 "cargo_cross_project_warm_hit": True, "rustup_cargo_routing": bool(rustup), "separate_final_binaries": True,
                 "caller_owned_inputs_preserved": True, "caller_targets": caller_targets,
