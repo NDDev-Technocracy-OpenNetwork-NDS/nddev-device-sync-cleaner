@@ -979,7 +979,12 @@ impl ManagedCache {
         if depth > 8 {
             return Err(CacheError::Configuration);
         }
-        let mut workspace_identity = cwd.as_os_str().as_encoded_bytes().to_vec();
+        // Do not reuse the former fine-grain layout. Its dirty-unit lock
+        // upgrades can deadlock independent Cargo processes (#17508 upstream).
+        // Sources/downloads still share CARGO_HOME; native output locks belong
+        // to one workspace, not the whole compiler lane.
+        let mut workspace_identity = b"cargo-workspace-output-v2\0".to_vec();
+        workspace_identity.extend(cwd.as_os_str().as_encoded_bytes());
         for (index, argument) in args.iter().enumerate() {
             if argument == "--manifest-path" {
                 if let Some(value) = args.get(index + 1) {
@@ -999,15 +1004,8 @@ impl ManagedCache {
         let target_path = lane_path.join("targets").join(&workspace);
         directory(&self.root, Path::new("cargo/home"))?;
         let root = &self.config.root;
-        let managed_build = if depth == 0 {
-            root.join(&lane_path).join("build")
-        } else {
-            root.join(&lane_path)
-                .join("build/nested")
-                .join(depth.to_string())
-                .join(&workspace)
-        };
         let managed_target = root.join(&target_path).join("cache");
+        let managed_build = managed_target.clone();
         let default_build = !caller_target && (nested || inherited_build.is_none());
         let default_target = !caller_target;
         let clear_parent_build = caller_target && inherited_defaults && inherited_build.is_some();
@@ -1044,9 +1042,6 @@ impl ManagedCache {
             .filter(|path| !path.is_empty())
             .map(|path| self.retain_managed_path(Path::new(path)))
             .transpose()?;
-        if default_build {
-            lane.create_dir_all("build")?;
-        }
         let source_home =
             std::env::var_os("CARGO_HOME").unwrap_or(self.cargo_home()?.into_os_string());
         let compiler_bin = rustc.parent().ok_or(CacheError::Provider)?;
@@ -1089,7 +1084,9 @@ impl ManagedCache {
             ("CARGO_HOME".into(), source_home),
             ("NDS_CLEANER_NESTING".into(), depth.to_string().into()),
             ("CARGO_UNSTABLE_MTIME_ON_USE".into(), "true".into()),
-            ("CARGO_UNSTABLE_FINE_GRAIN_LOCKING".into(), "true".into()),
+            // Keep Cargo's normal output-directory lock. The experimental
+            // unit-lock mode is not a safe cross-process cache boundary.
+            ("CARGO_UNSTABLE_FINE_GRAIN_LOCKING".into(), "false".into()),
             ("RUSTC".into(), rustc.into_os_string()),
             ("RUSTDOC".into(), rustdoc.into_os_string()),
             ("PATH".into(), path),
@@ -1106,11 +1103,7 @@ impl ManagedCache {
         if let Some(home) = &self.config.rustup_home {
             env.push(("RUSTUP_HOME".into(), home.as_os_str().to_owned()));
         }
-        let mut native_args = vec![
-            "-Zmtime-on-use".into(),
-            "-Zgc".into(),
-            "-Zfine-grain-locking".into(),
-        ];
+        let mut native_args = vec!["-Zmtime-on-use".into(), "-Zgc".into()];
         // Invocation-local configuration avoids propagating generated final-
         // output locks to native Cargo invoked directly by build scripts.
         for (default, key, path) in [

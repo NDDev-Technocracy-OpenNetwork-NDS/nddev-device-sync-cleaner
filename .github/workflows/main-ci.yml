@@ -75,7 +75,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          execution_source=935ba2639166d6ea368ecbab3a08d739271c3222
+          execution_source=3f75f6a10842271af206132e74a88159ccfbdf00
           execution="$RUNNER_TEMP/nds-cache-execution-source"
           git fetch --no-tags origin "$execution_source"
           git worktree add --detach "$execution" "$execution_source"
