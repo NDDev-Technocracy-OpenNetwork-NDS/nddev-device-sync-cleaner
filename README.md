@@ -64,7 +64,10 @@ Supply a private JSON file with `schema: 1`, absolute `root`, `cargo`, `rustc`,
 `rustdoc`, and optional `rustup`, `rustup_home`, `cargo_home`, `frontends`, `uv`,
 `bun` paths. The root must be canonical, user-owned and mode 0700. Initialization
 requires an empty directory and creates an ownership marker. Existing caches are
-not silently adopted. Provider binary paths come from the verified installation;
+not silently adopted. Optional `scan_entries` can lower the default 100,000-entry
+pass budget to pace maintenance; values outside 1..100,000 are rejected. Very
+small budgets may not reach an atomic unit. This never raises the discovery bound.
+Provider binary paths come from the verified installation;
 `frontends` selects a dedicated local tool prefix. Generate its argv-preserving
 Cargo/uv/Bun wrappers with `scripts/install-cache-frontends.py CONFIG BINARY`;
 the prefix refuses unrelated existing files. When a native Rustup backend is
@@ -79,16 +82,30 @@ nds-cleaner-cache /operator/config/cache.json uv sync --python 3.15.1
 nds-cleaner-cache /operator/config/cache.json bun install --frozen-lockfile
 nds-cleaner-cache /operator/config/cache.json clean
 nds-cleaner-cache /operator/config/cache.json clean --apply
+nds-cleaner-cache /operator/config/cache.json clean --apply --passes 32
 ```
 
 `clean` defaults to preview. JSON reports distinguish stale/removed native units,
 native GC calls, active leases and completed-use observations. Discovery keeps
 its entry and time limits, without charging native cleanup or use acknowledgments
 against traversal time. Native provider calls retain their own process deadline.
+Collection also has a one-minute pass budget, checked between atomic units;
+a native provider already started retains its 30-second deadline. Exhausting a
+pass yields `scan_complete: false` and defers source GC. Apply saves an owned,
+atomic `.gc-progress` cursor; the next apply resumes after completed objects or
+subtrees, rechecking current leases. A complete traversal clears the cursor.
+`resumed` identifies continuation passes. Preview validates but neither uses nor
+changes the cursor, and reports its own scan completeness. Scheduling may run
+multiple bounded passes to converge; an incomplete pass is not a full cleanup.
+The explicit `--apply --passes N` mode (1..32) returns all pass reports and exits
+75 if that batch remains incomplete. Schedulers can request this bounded batch
+instead of silently accepting a single incomplete pass. This CLI mode and its
+report fields are introduced in 0.0.1-alpha.3; existing single-pass calls remain
+supported.
 Cargo incremental, dependency and example payload directories are retained without
 traversal and counted as unknown; collection inspects recognized native unit
-groups instead. A bounded failure is an error, never a fabricated successful
-cleanup. Scheduling and device paths belong to the operator's estate. This CLI
+groups instead. Provider, ownership and filesystem failures remain errors;
+progress is never substituted for a completed traversal. Scheduling and device paths belong to the operator's estate. This CLI
 adds no remote mutation command.
 Frozen release artifacts must be staged outside mutable caches.
 

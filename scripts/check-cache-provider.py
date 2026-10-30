@@ -420,6 +420,75 @@ def qualify_externals(run, base, root, *, environment):
             "project_target_absent": True, "lock_unchanged": True}
 
 
+def qualify_bounded_passes(run, base, root, config, binary, environment):
+    # Interrupted preparation has no ownership lease yet. Retain it without
+    # blocking unrelated maintenance or adopting its payload.
+    incomplete = root / "bun" / hashlib.sha256(b"interrupted preparation").hexdigest()
+    (incomplete / "cache").mkdir(parents=True)
+    sentinel = incomplete / "cache/owner-input"
+    sentinel.write_bytes(b"preserve unknown native data")
+    # Real frontend commands create completed-use generations; a deliberately
+    # lower operator budget forces real CLI continuation, without a fake clock.
+    for index in range(70):
+        project = base / ("paced-" + str(index))
+        project.mkdir()
+        run("bun", "--cwd", project, "--version", cwd=base)
+    original = config.read_text()
+    paced = json.loads(original)
+    paced["scan_entries"] = 64
+    config.write_text(json.dumps(paced))
+    reports = []
+    try:
+        first = json.loads(run("clean", "--apply"))
+        reports.append(first)
+        assert not first["scan_complete"] and not first["resumed"]
+        cursor = root / ".gc-progress"
+        checkpoint = cursor.read_bytes()
+        observed = {str(p): p.read_bytes() for tool in ("uv", "bun")
+                    for p in (root / tool).glob("*/.last-use")
+                    if not (p.parent / ".pending-use").exists()}
+        stalled = dict(paced, scan_entries=1)
+        config.write_text(json.dumps(stalled))
+        limited = subprocess.run([str(binary), str(config), "clean", "--apply", "--passes", "1"],
+                                 env=environment, cwd=base, capture_output=True, text=True, timeout=120)
+        assert limited.returncode == 75, (limited.returncode, limited.stderr)
+        assert not json.loads(limited.stdout)["scan_complete"]
+        assert cursor.read_bytes() == checkpoint
+        config.write_text(json.dumps(paced))
+        preview = json.loads(run("clean"))
+        assert not preview["resumed"] and cursor.read_bytes() == checkpoint
+        checked_after_tick = False
+        for _ in range(32):
+            if observed and not checked_after_tick:
+                time.sleep(1.1)  # Distinguish real use timestamps across passes.
+                checked_after_tick = True
+            report = json.loads(run("clean", "--apply"))
+            reports.append(report)
+            assert report["resumed"]
+            assert all(Path(p).read_bytes() == value for p, value in observed.items())
+            observed.update({str(p): p.read_bytes() for tool in ("uv", "bun")
+                             for p in (root / tool).glob("*/.last-use")
+                             if not (p.parent / ".pending-use").exists()})
+            if report["scan_complete"]:
+                break
+        else:
+            raise AssertionError("bounded native collection did not converge")
+        assert not cursor.exists()
+        assert sentinel.read_bytes() == b"preserve unknown native data"
+        assert sum(r["completed_uses"] for r in reports) >= 70
+        assert len(observed) >= 70
+        batch = json.loads(call([binary, config, "clean", "--apply", "--passes", "32"],
+                                cwd=base, environment=environment))
+        assert batch["scan_complete"] and batch["passes"][-1]["scan_complete"]
+        assert not cursor.exists()
+        return {"native_passes": len(reports), "resume_after_budget": True,
+                "preview_and_previous_use_records_unchanged": True,
+                "converged_and_cursor_cleared": True,
+                "incomplete_batch_exit_75": True, "bounded_batch_completed": True}
+    finally:
+        config.write_text(original)
+
+
 def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_compatibility_only=False):
     versions = json.loads((REPO / "cache-providers.lock.json").read_text())["versions"]
     for name, expected in ({"cargo": versions["cargo"]} if caller_targets_only else versions).items():
@@ -590,6 +659,7 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
                 time.sleep(0.1)
         tool_reuse = qualify_tool_reuse(run, base, root, binary=binary, config=config,
                                        tools=tools, environment=fixture_env)
+        bounded_passes = qualify_bounded_passes(run, base, root, config, binary, fixture_env)
         # Native uv/Bun manage their own cached payloads. Lock generations
         # retain old downloads while recently used, regardless of filesystem age.
         python = base / "python"
@@ -602,7 +672,8 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
         (javascript / "package.json").write_text(json.dumps({"private": True, "dependencies": {"is-number": "7.0.0"}}))
         run("bun", "install", cwd=javascript)
         run("bun", "install", cwd=javascript)
-        shards = [path for tool in ("uv", "bun") for path in (root / tool).iterdir()]
+        shards = [path for tool in ("uv", "bun") for path in (root / tool).iterdir()
+                  if (path / ".lease").exists() and (path / ".last-use").exists()]
         def count(path):
             return sum(1 for item in (path / "cache").rglob('*') if item.is_file())
         for shard in shards:
@@ -614,13 +685,31 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
         assert [count(shard) for shard in shards] == before
         for shard in shards:
             (shard / ".last-use").write_text(str(old))
+        # A real but mismatched provider must fail, not become an incomplete
+        # successful pass or delete any idle native payload.
+        original_config = config.read_text()
+        invalid = json.loads(original_config)
+        invalid["uv"] = str(tools / "bun")
+        config.write_text(json.dumps(invalid))
+        try:
+            try:
+                run("clean", "--apply")
+            except RuntimeError as error:
+                assert "qualified version" in str(error)
+            else:
+                raise AssertionError("mismatched native provider unexpectedly accepted")
+            assert [count(shard) for shard in shards] == before
+        finally:
+            config.write_text(original_config)
         report = json.loads(run("clean", "--apply"))
+        assert report["scan_complete"] and not report["resumed"]
         after = [count(shard) for shard in shards]
         assert report["native_cache_runs"] >= len(shards) + 1
         assert sum(after) < sum(before)
         assert call([python / ".venv/bin/python", "-c", "import idna,sys;print(sys.version_info[:3])"]).strip() == "(3, 15, 1)"
         assert call([tools / "bun", "-e", 'console.log(require("is-number")(7))'], cwd=javascript).strip() == "true"
-        return {"external_subcommands": externals, "online_offline_tool_reuse": tool_reuse,
+        return {"bounded_collection": bounded_passes,
+                "external_subcommands": externals, "online_offline_tool_reuse": tool_reuse,
                 "cargo_cross_project_warm_hit": True, "rustup_cargo_routing": bool(rustup), "separate_final_binaries": True,
                 "caller_owned_inputs_preserved": True, "caller_targets": caller_targets,
                 "manifest_target_isolation": True, "native_and_wrapped_nested_builds": True,
