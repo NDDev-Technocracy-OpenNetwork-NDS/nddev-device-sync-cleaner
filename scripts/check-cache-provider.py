@@ -902,6 +902,12 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
                 os.utime(path, (old, old), follow_symlinks=False)
             os.utime(shard / "cache", (old, old))
         before = [count(shard) for shard in shards]
+        # Cleaning an empty uv generation creates its native .lock file. Use
+        # actual downloaded payloads for the deletion proof, not total files
+        # across many deliberately empty continuation generations.
+        native_payloads = [item for shard in shards if shard.parent.name == "uv"
+                           for item in (shard / "cache").glob("archive-v*/**/*.py")]
+        assert native_payloads, "real uv download did not create a native payload"
         run("clean", "--apply")
         assert [count(shard) for shard in shards] == before
         for shard in shards:
@@ -927,7 +933,10 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
         after = [count(shard) for shard in shards]
         qualified_shards = [p for p in shards if p.parent.name != "bun" or sys.platform == "linux"]
         assert report["native_cache_runs"] >= len(qualified_shards) + 1
-        assert sum(after) < sum(before)
+        assert any(not item.exists() for item in native_payloads)
+        if sys.platform != "linux":
+            assert all(after[index] == before[index] for index, shard in enumerate(shards)
+                       if shard.parent.name == "bun")
         assert call([python / ".venv/bin/python", "-c", "import idna,sys;print(sys.version_info[:3])"]).strip() == "(3, 15, 1)"
         assert call([tools / "bun", "-e", 'console.log(require("is-number")(7))'], cwd=javascript).strip() == "true"
         configured_retention = qualify_retention_policy(base, config, binary, fixture_env)
