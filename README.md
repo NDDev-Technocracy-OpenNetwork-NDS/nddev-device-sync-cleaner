@@ -19,7 +19,13 @@ lock into build-script Cargo calls. Explicit staging outside managed roots stays
 with its caller. Existing project lockfiles keep their owner.
 `cargo clippy ...` and `cargo nextest ...` commands enter their native
 tools with the managed Cargo frontend. Their Cargo children retain the same
-scope; build-script recursion still receives a separate nesting scope. Clippy
+scope when they re-enter the frontend. Wrapped build-script recursion receives
+a separate nesting scope. A pinned native Cargo may overwrite `CARGO` with its
+own executable in build scripts; direct native descendants then do not inherit
+invocation-local managed placement. Their successful compilation is not a
+placement acceptance. Qualify native descendant paths separately, or use the
+already selected frontend explicitly; exporting a shared parent target can
+introduce ancestor output-lock contention and is not a substitute. Clippy
 uses the selected compiler's installed component; Nextest uses the existing
 native command lookup. Native global offline/lock/config/color/verbosity and
 `-Z` options before those commands are forwarded. These routes require
@@ -30,10 +36,10 @@ after `--` are forwarded unchanged.
 
 Cleanup retains active shared leases, including native children surviving Cargo's
 exit. An exclusive lease permits removal only of known native unit groups whose
-use fingerprint is older than 72 hours. Unknown layouts, future timestamps and
+use fingerprint is older than the configured idle policy. Unknown layouts, future timestamps and
 unowned roots are retained. Capability-relative filesystem operations contain
 symlink traversal. Cargo's native `clean gc -Zgc` owns source/archive/index/Git
-cleanup with all five age limits set to three days. An optional existing native
+cleanup with all five age limits set to that policy (legacy default three days). An optional existing native
 Cargo home keeps its own credentials, installed programs and native cache locks.
 
 uv generation v2 and Bun generation v3 are identified by the qualified provider version,
@@ -107,7 +113,11 @@ nds-cleaner-cache /operator/config/cache.json clean --apply --passes 32
 ```
 
 `clean` defaults to preview. JSON reports distinguish stale/removed native units,
-native GC calls, active leases and completed-use observations. Discovery keeps
+native GC calls, active leases and completed-use observations. `empty_units`
+counts expired uv generations with no entries except an optional empty regular
+native `.lock`. These do not run another native GC and are not removed units or
+reclaimed bytes. Their directory, lock, lease and last-use ledger stay in place;
+active/native locks and pending-use observations still take precedence. Discovery keeps
 its entry and time limits, without charging native cleanup or use acknowledgments
 against traversal time. Native provider calls retain their own process deadline.
 Collection also has a one-minute pass budget, checked between atomic units;
@@ -156,7 +166,7 @@ shorter consumer RPC deadline.
 The existing main workflow also retains `nds-cache-native-Linux-X64` and
 `nds-cache-native-macOS-ARM64` archives after actual native release-binary
 qualification. Each contains a separately pinned compatible alpha.5 execution
-binary and current alpha.6 maintenance binary, their source commits, the native
+binary and current alpha.7 maintenance binary, their source commits, the native
 frontend helper, tool/compiler identities, license and ordinary `SHA256SUMS`
 inside a tar archive that preserves native executable modes.
 These are finite CI artifacts, not an installed selection or host acceptance.
