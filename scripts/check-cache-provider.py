@@ -466,10 +466,11 @@ def qualify_retention_policy(base, config, binary, environment):
             "bun_collection": "qualified" if sys.platform == "linux" else "deferred"}
 
 
-def qualify_bun_descendants(base, config, binary, environment):
+def qualify_bun_descendants(base, config, binary, environment, consumer_binary=None):
     """Real Bun closes inherited fds; the owned subreaper must still guard them."""
     if sys.platform != "linux":
         return {"collection": "deferred", "reason": "native_descendant_scope_not_qualified"}
+    consumer_binary = consumer_binary or binary
     project = base / "bun-descendants"
     project.mkdir()
     root = base / "bun-descendant-cache"
@@ -508,7 +509,7 @@ def qualify_bun_descendants(base, config, binary, environment):
         script = ("const c=Bun.spawn(" + json.dumps([sys.executable, "-c", child])
                   + ',{stdio:["ignore","ignore","ignore"]});c.unref();process.exit(17);')
         start = time.monotonic()
-        result = subprocess.run([str(binary), str(path), "bun", "-e", script], cwd=project,
+        result = subprocess.run([str(consumer_binary), str(path), "bun", "-e", script], cwd=project,
                                 env=environment, capture_output=True, timeout=15)
         assert result.returncode == 17, (result.stdout, result.stderr)
         assert time.monotonic() - start < 2, "foreground exit waited for background child"
@@ -710,7 +711,133 @@ def qualify_bounded_passes(run, base, root, config, binary, environment):
         config.write_text(original)
 
 
-def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_compatibility_only=False):
+def qualify_native_owner_locks(base, config, binary, environment):
+    """Real raw native consumers must defer GC even without a frontend lease."""
+    base = base / "native-owner-locks"
+    base.mkdir()
+    root = base / "cache"
+    path = base / "config.json"
+    settings = dict(json.loads(config.read_text()), root=str(root), frontends=None,
+                    cargo_home=None, retention_seconds=86400)
+    path.write_text(json.dumps(settings))
+    call([binary, path, "init"], cwd=base, environment=environment)
+
+    def collect(apply=True):
+        args = [binary, path, "clean", *(["--apply"] if apply else [])]
+        report = json.loads(call(args, cwd=base, environment=environment))
+        assert report["scan_complete"]
+        return report
+
+    def ready(process, marker):
+        deadline = time.monotonic() + 30
+        while not marker.exists():
+            assert process.poll() is None, process.communicate()
+            assert time.monotonic() < deadline, "native owner did not reach its bounded gate"
+            time.sleep(0.01)
+
+    def release(process, fifo):
+        descriptor = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            os.write(descriptor, b"1")
+            output, error = process.communicate(timeout=15)
+            assert process.returncode == 0, (output, error)
+        finally:
+            os.close(descriptor)
+
+    def dispose(process):
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=10)
+
+    # Cargo's global source cache is shared across target roots and native tools.
+    cargo = base / "raw-cargo"
+    (cargo / "src").mkdir(parents=True)
+    pin = next(p["version"] for p in tomllib.loads((REPO / "Cargo.lock").read_text())["package"] if p["name"] == "itoa")
+    (cargo / "Cargo.toml").write_text('[package]\nname="native-cache-owner"\nversion="0.0.0"\nedition="2024"\n[dependencies]\nitoa="=' + pin + '"\n')
+    (cargo / "src/lib.rs").write_text('pub fn value() -> u8 { 1 }\n')
+    gate, marker = base / "cargo-release", cargo / "ready"
+    os.mkfifo(gate, 0o600)
+    (cargo / "build.rs").write_text('use std::io::Read; fn main() { std::fs::write("ready", b"1").unwrap(); let mut value=[0]; std::fs::File::open(' + json.dumps(str(gate)) + ').unwrap().read_exact(&mut value).unwrap(); }\n')
+    native_env = dict(environment, CARGO_HOME=str(root / "cargo/home"),
+                      CARGO_TARGET_DIR=str(base / "native-target"), RUSTC=settings["rustc"],
+                      RUSTDOC=settings["rustdoc"], RUSTUP_TOOLCHAIN="1.99.1")
+    native_cargo = Path(settings["cargo"])
+    call([native_cargo, "generate-lockfile"], cwd=cargo, environment=native_env)
+    call([native_cargo, "fetch", "--locked"], cwd=cargo, environment=native_env)
+    process = subprocess.Popen([str(native_cargo), "build", "--locked", "--offline"], cwd=cargo,
+                               env=native_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True)
+    try:
+        ready(process, marker)
+        report = collect()
+        assert report["busy"] >= 1 and report["source_gc_deferred"]
+        assert process.poll() is None
+        release(process, gate)
+    finally:
+        if process.poll() is None:
+            try:
+                release(process, gate)
+            except (OSError, AssertionError, subprocess.SubprocessError):
+                dispose(process)
+    assert not collect()["source_gc_deferred"]
+
+    # uv keeps a shared native cache lock while the PEP517 backend is running.
+    python = base / "raw-python"
+    python.mkdir()
+    gate, marker = base / "uv-release", python / "ready"
+    os.mkfifo(gate, 0o600)
+    (python / "pyproject.toml").write_text('[project]\nname="native-cache-owner"\nversion="0.0.0"\n[build-system]\nrequires=[]\nbuild-backend="backend"\nbackend-path=["."]\n')
+    (python / "backend.py").write_text('''from pathlib import Path
+import zipfile
+def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    Path(''' + repr(str(marker)) + ''').write_text("1")
+    with open(''' + repr(str(gate)) + ''', "rb") as release:
+        release.read(1)
+    name="native_cache_owner-0.0.0-py3-none-any.whl"
+    with zipfile.ZipFile(Path(wheel_directory)/name, "w") as wheel:
+        wheel.writestr("native_cache_owner/__init__.py", "value=1\\n")
+        wheel.writestr("native_cache_owner-0.0.0.dist-info/METADATA", "Metadata-Version: 2.1\\nName: native-cache-owner\\nVersion: 0.0.0\\n")
+        wheel.writestr("native_cache_owner-0.0.0.dist-info/WHEEL", "Wheel-Version: 1.0\\nGenerator: native-owner-fixture\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n")
+        wheel.writestr("native_cache_owner-0.0.0.dist-info/RECORD", "")
+    return name
+''')
+    call([binary, path, "uv", "--version"], cwd=python, environment=environment)
+    collect()
+    shards = list((root / "uv").iterdir())
+    assert len(shards) == 1
+    shard = shards[0]
+    (shard / ".last-use").write_text(str(int(time.time()) - 7 * 86400))
+    native_env = dict(environment, UV_CACHE_DIR=str(shard / "cache"))
+    process = subprocess.Popen([settings["uv"], "build", "--wheel", "--no-build-isolation",
+                                "--python", "3.15.1", "--no-python-downloads", "--out-dir", str(base / "wheels")],
+                               cwd=python, env=native_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True)
+    try:
+        ready(process, marker)
+        report = collect()
+        assert report["busy"] >= 1 and report["stale_units"] == 0
+        assert (shard / ".pending-use").read_bytes() == b"1"
+        snapshot = (shard / ".last-use").read_bytes()
+        assert collect(False)["busy"] >= 1
+        assert (shard / ".last-use").read_bytes() == snapshot
+        assert process.poll() is None
+        release(process, gate)
+    finally:
+        if process.poll() is None:
+            try:
+                release(process, gate)
+            except (OSError, AssertionError, subprocess.SubprocessError):
+                dispose(process)
+    report = collect()
+    assert report["completed_uses"] == 1 and report["stale_units"] == 0
+    assert not (shard / ".pending-use").exists()
+    assert list((base / "wheels").glob("*.whl"))
+    return {"raw_cargo_global_lock_deferred": True, "raw_uv_cache_lock_deferred": True,
+            "native_jobs_not_interrupted": True, "observed_native_use_starts_idle_after_completion": True,
+            "busy_preview_preserves_records": True, "next_complete_pass_succeeds": True}
+
+
+def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_compatibility_only=False, native_locks_only=False):
     versions = json.loads((REPO / "cache-providers.lock.json").read_text())["versions"]
     for name, expected in ({"cargo": versions["cargo"]} if caller_targets_only else versions).items():
         reported = call([tools / name, "--version"]).strip()
@@ -749,6 +876,8 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
         if tool_compatibility_only:
             return qualify_tool_reuse(run, base, root, binary=binary, config=config,
                                       tools=tools, environment=fixture_env)
+        if native_locks_only:
+            return qualify_native_owner_locks(base, config, binary, fixture_env)
         externals = qualify_externals(run, base, root, environment=fixture_env)
         packages = tomllib.loads((REPO / "Cargo.lock").read_text())["package"]
         pins = {name: next(item["version"] for item in packages if item["name"] == name)
@@ -942,7 +1071,9 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
         configured_retention = qualify_retention_policy(base, config, binary, fixture_env)
         descendants = qualify_bun_descendants(base, config, binary, fixture_env)
         placement = qualify_uv_placement(base, config, binary, fixture_env)
+        native_locks = qualify_native_owner_locks(base, config, binary, fixture_env)
         return {"bun_descendant_lifetime": descendants,
+                "native_owner_locks": native_locks,
                 "uv_environment_placement": placement,
                 "configured_retention": configured_retention, "bounded_collection": bounded_passes,
                 "external_subcommands": externals, "online_offline_tool_reuse": tool_reuse,
@@ -966,7 +1097,10 @@ if __name__ == "__main__":
                         help="run only real offline Cargo caller-target qualification in the owned fixture")
     parser.add_argument("--tool-compatibility-only", action="store_true",
                         help="qualify cold offline refusal and online-to-offline reuse with real uv/Bun")
+    parser.add_argument("--native-locks-only", action="store_true",
+                        help="exercise real raw Cargo/uv lock contention in the owned fixture")
     args = parser.parse_args()
     print(json.dumps(qualify(args.binary.resolve(), args.tools.resolve(), args.rustc.resolve(), args.rustdoc.resolve(),
                               caller_targets_only=args.caller_targets_only,
-                              tool_compatibility_only=args.tool_compatibility_only)))
+                              tool_compatibility_only=args.tool_compatibility_only,
+                              native_locks_only=args.native_locks_only)))
