@@ -27,12 +27,42 @@ fn run() {
         match operation.to_str() {
             Some("cargo") => cache.run_cargo(&args),
             Some("uv" | "bun") => cache.run_tool(operation.to_str().unwrap_or_default(), &args),
-            Some("clean") if args.is_empty() || args == ["--apply"] => {
-                let report = cache.collect(!args.is_empty()).map_err(|e| e.to_string())?;
+            Some("clean") => {
+                let (apply, passes, batch) = match args.as_slice() {
+                    [] => (false, 1, false),
+                    [apply] if apply == "--apply" => (true, 1, false),
+                    [apply, flag, count] if apply == "--apply" && flag == "--passes" => {
+                        let count = count
+                            .to_str()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .filter(|n| (1..=32).contains(n))
+                            .ok_or("passes must be between 1 and 32")?;
+                        (true, count, true)
+                    }
+                    _ => return Err("unsupported cleanup arguments".to_owned()),
+                };
+                let mut reports = Vec::new();
+                for _ in 0..passes {
+                    let report = cache.collect(apply).map_err(|e| e.to_string())?;
+                    let complete = report.scan_complete;
+                    reports.push(report);
+                    if complete {
+                        break;
+                    }
+                }
+                let complete = reports.last().is_some_and(|r| r.scan_complete);
+                let value = if batch {
+                    serde_json::json!({"schema": 1, "scan_complete": complete, "passes": reports})
+                } else {
+                    serde_json::to_value(&reports[0]).map_err(|_| "report encoding failed")?
+                };
                 println!(
                     "{}",
-                    serde_json::to_string(&report).map_err(|_| "report encoding failed")?
+                    serde_json::to_string(&value).map_err(|_| "report encoding failed")?
                 );
+                if batch && !complete {
+                    std::process::exit(75);
+                }
                 return Ok(());
             }
             _ => return Err("unsupported operation".to_owned()),
