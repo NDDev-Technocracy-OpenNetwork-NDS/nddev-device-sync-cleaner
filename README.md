@@ -7,10 +7,16 @@ policy preview and completed run. Its manifest grants read/process capabilities.
 `nds-cleaner-cache` owns opt-in local development cache maintenance on Linux x86_64
 and macOS arm64. Installations and configuration stay outside the source checkout.
 
-Managed Cargo intermediates are shared across projects, separated by complete
-compiler identity and host. Final artifacts have separate workspace directories.
+Cargo source/download caches remain shared. Managed compiled outputs are separated
+by complete compiler identity, host, workspace and output-layout generation.
+Native Cargo's normal output-directory lock serializes conflicting work in that
+workspace; independent workspaces can compile concurrently. The frontend no longer
+forces experimental fine-grain locking: concurrent dirty shared units can form
+[a native lock-upgrade cycle](https://github.com/rust-lang/cargo/issues/17508).
+Old shared outputs remain preserved under their existing leases and retention.
+Isolated outputs do not establish cross-workspace compiled-artifact reuse.
 The wrapper selects each project's Rustup compiler, including `cargo +toolchain`;
-its Cargo frontend uses qualified nightly use tracking and fine-grained locks. NDS builds
+its Cargo frontend uses qualified nightly use tracking and native output locks. NDS builds
 retain their pinned stable compiler. A fixed compiler installation rejects a
 conflicting project toolchain file. Caller-selected compilers, prepared Cargo
 homes and final/intermediate staging paths are honored. Invocation-local cache
