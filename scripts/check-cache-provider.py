@@ -597,9 +597,12 @@ def qualify_uv_placement(base, config, binary, environment, source=None):
     module = Path(result["module"])
     assert installed.is_relative_to(environments) and installed != previous
     assert module.stat().st_dev == root.stat().st_dev
-    candidates = root.glob("uv/*/cache/archive-v*/**/idna/__init__.py")
-    assert any((item.stat().st_dev, item.stat().st_ino) == (module.stat().st_dev, module.stat().st_ino)
-               for item in candidates), "native uv did not retain its hardlink backend"
+    candidates = list(root.glob("uv/*/cache/archive-v*/**/idna/__init__.py"))
+    assert any(item.read_bytes() == module.read_bytes() for item in candidates)
+    hardlinked = any((item.stat().st_dev, item.stat().st_ino) == (module.stat().st_dev, module.stat().st_ino)
+                     for item in candidates)
+    if sys.platform == "linux":
+        assert hardlinked, "native uv did not retain its hardlink backend"
     selected = json.loads(run("uv", "--directory", project, "run", "--offline", *probe))
     assert selected["prefix"] == str(installed)
     active = json.loads(run("uv", "run", "--active", "--offline", *probe,
@@ -619,7 +622,8 @@ def qualify_uv_placement(base, config, binary, environment, source=None):
     assert report["native_cache_runs"] == 2
     assert module.is_file() and hashlib.sha256(old_module.read_bytes()).hexdigest() == old_hash
     assert json.loads(call([installed / "bin/python", *probe[1:]], environment=environment))["prefix"] == str(installed)
-    return {"new_environment_on_cache_device": True, "native_hardlink_observed": True,
+    return {"new_environment_on_cache_device": True, "native_hardlink_observed": hardlinked,
+            "native_backend_not_forced": True,
             "explicit_and_active_environments_preserved": True, "original_environment_unchanged": True,
             "installed_environment_survives_native_gc": True, "lock_unchanged": True,
             "source_on_different_device": project.stat().st_dev != root.stat().st_dev}
@@ -637,7 +641,15 @@ def qualify_bounded_passes(run, base, root, config, binary, environment):
     for index in range(70):
         project = base / ("paced-" + str(index))
         project.mkdir()
-        run("bun", "--cwd", project, "--version", cwd=base)
+        if sys.platform == "linux":
+            run("bun", "--cwd", project, "--version", cwd=base)
+        else:
+            run("uv", "--directory", project, "--version", cwd=base)
+    unqualified = {}
+    if sys.platform != "linux":
+        run("bun", "--cwd", base, "--version", cwd=base)
+        unqualified = {str(p): p.read_bytes() for p in (root / "bun").glob("*/.last-use")}
+        assert unqualified
     original = config.read_text()
     paced = json.loads(original)
     paced["scan_entries"] = 64
@@ -686,10 +698,14 @@ def qualify_bounded_passes(run, base, root, config, binary, environment):
                                 cwd=base, environment=environment))
         assert batch["scan_complete"] and batch["passes"][-1]["scan_complete"]
         assert not cursor.exists()
+        assert all(Path(p).read_bytes() == content and (Path(p).parent / ".pending-use").read_bytes() == b"1"
+                   for p, content in unqualified.items())
         return {"native_passes": len(reports), "resume_after_budget": True,
                 "preview_and_previous_use_records_unchanged": True,
                 "converged_and_cursor_cleared": True,
-                "incomplete_batch_exit_75": True, "bounded_batch_completed": True}
+                "incomplete_batch_exit_75": True, "bounded_batch_completed": True,
+                "completed_use_provider": "bun" if sys.platform == "linux" else "uv",
+                "unqualified_bun_pending_preserved": bool(unqualified)}
     finally:
         config.write_text(original)
 
