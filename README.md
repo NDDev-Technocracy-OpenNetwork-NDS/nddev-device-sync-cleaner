@@ -139,3 +139,16 @@ temporary fixture. CI uses public GitHub-hosted runners; native cache acceptance
 runs on its qualified architectures. There is no backup/recovery implementation.
 
 Release journals: [GitHub Releases](https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-cleaner/releases).
+
+
+Native owner contention is independent of a frontend lease. Before acknowledging
+uv completion or running its cache GC, maintenance probes uv's real cache lock.
+Observed raw native activity becomes pending use; completion and the idle period
+are acknowledged only after both locks are free. Cargo source GC also probes its
+global download/mutation locks, including native jobs using other target roots.
+Busy owners are deferred without interruption. A timeout race is classified as
+busy only while the relevant native lock is still demonstrably held; other
+native failures retain their provider, operation, reason and exit category.
+No provider argv, private paths or raw provider output is rendered in that error.
+The process timeout and scan budgets are unchanged and do not establish a
+shorter consumer RPC deadline.
