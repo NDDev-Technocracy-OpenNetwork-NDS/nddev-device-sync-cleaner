@@ -186,8 +186,7 @@ fn reads_current_checkout() {
 
     # Benign parent config must not erase generated recursion context. Child
     # metadata observes actual native paths without compiling the child.
-    # Qualify benign pre-command global config in the same native matcher as
-    # generated defaults; split root/subcommand config remains a parity gap.
+    # Qualify benign config without erasing generated recursion context.
     nesting_context = []
     for label, options in (("plain", []), ("offline", ["--config", "net.offline=true"])):
         case = base / ("managed-context-" + label)
@@ -314,10 +313,183 @@ with open(sys.argv[1], "r+") as stream:
             "managed_nesting_context": nesting_context,
             "known_managed_target_and_build_namespace": True, "native_errors_and_forwarded_argv": True,
             "caller_home_sentinel_sha256": hashlib.sha256(sentinel.read_bytes()).hexdigest(),
-            "config_parity": "not qualified: hierarchical config and later CLI config remain separate gaps"}
+            "config_parity": "hierarchical config remains conservative; CLI configs share one native matcher"}
 
 
-def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False):
+def qualify_tool_reuse(run, base, root, *, binary, config, tools, environment):
+    """Cold offline refusal, online fill and fresh offline install through the frontend."""
+    python = base / "offline-python"
+    python.mkdir()
+    (python / "pyproject.toml").write_text(
+        '[project]\nname="offline-cache-probe"\nversion="0.0.0"\n'
+        'requires-python=">=3.15"\ndependencies=["idna==3.11"]\n')
+    run("uv", "lock", "--python", "3.15.1", cwd=python)
+    lock = (python / "uv.lock").read_bytes()
+    def generations(tool):
+        return {p.name for p in (root / tool).iterdir() if p.is_dir()}
+    offline_env = {"UV_PROJECT_ENVIRONMENT": str(python / "offline-env")}
+    def refuses(operation):
+        try:
+            operation()
+        except RuntimeError as error:
+            assert "offline" in str(error).lower(), str(error)
+        else:
+            raise AssertionError("cold offline install unexpectedly succeeded")
+    refuses(lambda: run("uv", "sync", "--locked", "--offline", "--python", "3.15.1",
+                        cwd=python, overrides=offline_env))
+    uv_generations = generations("uv")
+    run("uv", "sync", "--locked", "--python", "3.15.1", cwd=python,
+        overrides={"UV_PROJECT_ENVIRONMENT": str(python / "online-env")})
+    run("uv", "sync", "--locked", "--offline", "--no-progress", "--python", "3.15.1",
+        cwd=python, overrides=offline_env)
+    assert generations("uv") == uv_generations
+    assert (python / "uv.lock").read_bytes() == lock
+    assert call([python / "offline-env/bin/python", "-c", "import idna;print(idna.__version__)"]).strip() == "3.11"
+
+    # A real foreground native uv/Python process must retain its generation lease.
+    ready = python / "ready"
+    script = "import pathlib,time;pathlib.Path(" + repr(str(ready)) + ").touch();time.sleep(2)"
+    child = subprocess.Popen([str(binary), str(config), "uv", "run", "--locked", "--offline",
+                              "--python", "3.15.1", "--", "python", "-c", script], cwd=python,
+                             env=dict(environment, **offline_env), stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        deadline = time.monotonic() + 15
+        while not ready.exists():
+            assert child.poll() is None, child.communicate()
+            assert time.monotonic() < deadline, "native uv lease probe did not start"
+            time.sleep(0.02)
+        report = json.loads(run("clean"))
+        assert report["busy"] >= 1
+        output, error = child.communicate(timeout=10)
+        assert child.returncode == 0, (output, error)
+    finally:
+        if child.poll() is None:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.communicate(timeout=10)
+
+    javascript = base / "offline-javascript"
+    javascript.mkdir()
+    (javascript / "package.json").write_text(json.dumps(
+        {"private": True, "dependencies": {"is-number": "7.0.0"}}))
+    run("bun", "install", "--lockfile-only", cwd=javascript)
+    lock = (javascript / "bun.lock").read_bytes()
+    refuses(lambda: run("bun", "install", "--frozen-lockfile", "--offline", cwd=javascript))
+    bun_generations = generations("bun")
+    run("bun", "install", "--frozen-lockfile", cwd=javascript)
+    shutil.rmtree(javascript / "node_modules")  # Only this disposable fixture install.
+    run("bun", "install", "--frozen-lockfile", "--offline", cwd=javascript)
+    assert generations("bun") == bun_generations
+    assert (javascript / "bun.lock").read_bytes() == lock
+    assert call([tools / "bun", "-e", 'console.log(require("is-number")(7))'], cwd=javascript).strip() == "true"
+    return {"uv_cold_offline_refused": True, "uv_online_to_fresh_offline": True,
+            "uv_native_foreground_lease": True, "bun_cold_offline_refused": True,
+            "bun_online_to_fresh_offline": True, "unchanged_lock_and_generation": True}
+
+
+def qualify_externals(run, base, root, *, environment):
+    project = base / "external-cargo"
+    (project / "src").mkdir(parents=True)
+    (project / "Cargo.toml").write_text(
+        '[package]\nname="external-cargo-probe"\nversion="0.0.0"\nedition="2024"\n')
+    (project / "src/lib.rs").write_text('#[test]\nfn works(){assert_eq!(2+2,4);}\n')
+    run("cargo", "generate-lockfile", "--offline", cwd=project)
+    lock = (project / "Cargo.lock").read_bytes()
+    output = run("cargo", "clippy", "--locked", "--offline", "--all-targets",
+                 "--message-format=json", "--", "-D", "warnings", cwd=project)
+    artifacts = [json.loads(line) for line in output.splitlines() if line.startswith('{')]
+    paths = [Path(p) for a in artifacts if a.get("reason") == "compiler-artifact" for p in a["filenames"]]
+    assert paths and all(p.is_relative_to(root / "cargo/lanes") for p in paths), paths
+    run("cargo", "--offline", "clippy", "--locked", "--all-targets", "--", "-D", "warnings", cwd=project)
+    run("cargo", "--config", "net.offline=true", "clippy", "--locked", "--all-targets", cwd=project)
+    assert not (project / "target").exists()
+    nextest = "not installed; not qualified in this context"
+    if shutil.which("cargo-nextest", path=environment.get("PATH")):
+        run("cargo", "nextest", "run", "--offline", cwd=project)
+        run("cargo", "--offline", "nextest", "run", cwd=project)
+        run("cargo", "--config", "net.offline=true", "nextest", "run", cwd=project)
+        listing = json.loads(run("cargo", "nextest", "list", "--offline", "--message-format", "json", cwd=project))
+        target = Path(listing["rust-build-meta"]["target-directory"])
+        assert target.is_relative_to(root / "cargo/lanes"), target
+        suites = list(listing["rust-suites"].values())
+        assert suites and all(Path(s["binary-path"]).is_relative_to(root / "cargo/lanes") for s in suites)
+        assert not (project / "target").exists()
+        nextest = "real run/list passed; target and binaries in managed lanes"
+    assert (project / "Cargo.lock").read_bytes() == lock
+    return {"real_clippy_managed_artifacts": True, "nextest": nextest,
+            "project_target_absent": True, "lock_unchanged": True}
+
+
+def qualify_bounded_passes(run, base, root, config, binary, environment):
+    # Interrupted preparation has no ownership lease yet. Retain it without
+    # blocking unrelated maintenance or adopting its payload.
+    incomplete = root / "bun" / hashlib.sha256(b"interrupted preparation").hexdigest()
+    (incomplete / "cache").mkdir(parents=True)
+    sentinel = incomplete / "cache/owner-input"
+    sentinel.write_bytes(b"preserve unknown native data")
+    # Real frontend commands create completed-use generations; a deliberately
+    # lower operator budget forces real CLI continuation, without a fake clock.
+    for index in range(70):
+        project = base / ("paced-" + str(index))
+        project.mkdir()
+        run("bun", "--cwd", project, "--version", cwd=base)
+    original = config.read_text()
+    paced = json.loads(original)
+    paced["scan_entries"] = 64
+    config.write_text(json.dumps(paced))
+    reports = []
+    try:
+        first = json.loads(run("clean", "--apply"))
+        reports.append(first)
+        assert not first["scan_complete"] and not first["resumed"]
+        cursor = root / ".gc-progress"
+        checkpoint = cursor.read_bytes()
+        observed = {str(p): p.read_bytes() for tool in ("uv", "bun")
+                    for p in (root / tool).glob("*/.last-use")
+                    if not (p.parent / ".pending-use").exists()}
+        stalled = dict(paced, scan_entries=1)
+        config.write_text(json.dumps(stalled))
+        limited = subprocess.run([str(binary), str(config), "clean", "--apply", "--passes", "1"],
+                                 env=environment, cwd=base, capture_output=True, text=True, timeout=120)
+        assert limited.returncode == 75, (limited.returncode, limited.stderr)
+        assert not json.loads(limited.stdout)["scan_complete"]
+        assert cursor.read_bytes() == checkpoint
+        config.write_text(json.dumps(paced))
+        preview = json.loads(run("clean"))
+        assert not preview["resumed"] and cursor.read_bytes() == checkpoint
+        checked_after_tick = False
+        for _ in range(32):
+            if observed and not checked_after_tick:
+                time.sleep(1.1)  # Distinguish real use timestamps across passes.
+                checked_after_tick = True
+            report = json.loads(run("clean", "--apply"))
+            reports.append(report)
+            assert report["resumed"]
+            assert all(Path(p).read_bytes() == value for p, value in observed.items())
+            observed.update({str(p): p.read_bytes() for tool in ("uv", "bun")
+                             for p in (root / tool).glob("*/.last-use")
+                             if not (p.parent / ".pending-use").exists()})
+            if report["scan_complete"]:
+                break
+        else:
+            raise AssertionError("bounded native collection did not converge")
+        assert not cursor.exists()
+        assert sentinel.read_bytes() == b"preserve unknown native data"
+        assert sum(r["completed_uses"] for r in reports) >= 70
+        assert len(observed) >= 70
+        batch = json.loads(call([binary, config, "clean", "--apply", "--passes", "32"],
+                                cwd=base, environment=environment))
+        assert batch["scan_complete"] and batch["passes"][-1]["scan_complete"]
+        assert not cursor.exists()
+        return {"native_passes": len(reports), "resume_after_budget": True,
+                "preview_and_previous_use_records_unchanged": True,
+                "converged_and_cursor_cleared": True,
+                "incomplete_batch_exit_75": True, "bounded_batch_completed": True}
+    finally:
+        config.write_text(original)
+
+
+def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_compatibility_only=False):
     versions = json.loads((REPO / "cache-providers.lock.json").read_text())["versions"]
     for name, expected in ({"cargo": versions["cargo"]} if caller_targets_only else versions).items():
         reported = call([tools / name, "--version"]).strip()
@@ -342,7 +514,7 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False):
                                      "uv": str(tools / "uv"), "bun": str(tools / "bun")}))
         call([sys.executable, REPO / "scripts/install-cache-frontends.py", config, binary])
         fixture_env = dict(os.environ)
-        for key in ("CARGO", "CARGO_HOME", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC", "RUSTDOC", "RUSTUP_TOOLCHAIN", "NDS_CLEANER_MANAGED_BUILD_DIR", "NDS_CLEANER_MANAGED_TARGET_DIR", "NDS_CLEANER_NESTING"):
+        for key in ("CARGO", "CARGO_HOME", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC", "RUSTDOC", "RUSTUP_TOOLCHAIN", "NDS_CLEANER_MANAGED_BUILD_DIR", "NDS_CLEANER_MANAGED_TARGET_DIR", "NDS_CLEANER_NESTING", "NDS_CLEANER_EXTERNAL", "UV_WORKING_DIR", "UV_PROJECT", "UV_PROJECT_ENVIRONMENT", "UV_PYTHON", "VIRTUAL_ENV", "CONDA_PREFIX"):
             fixture_env.pop(key, None)
         if rustup:
             fixture_env["RUSTUP_TOOLCHAIN"] = "1.99.1"
@@ -353,6 +525,10 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False):
         if caller_targets_only:
             return qualify_caller_targets(run, base, root, binary=binary, config=config, tools=tools,
                                           rustc=rustc, rustdoc=rustdoc, environment=fixture_env)
+        if tool_compatibility_only:
+            return qualify_tool_reuse(run, base, root, binary=binary, config=config,
+                                      tools=tools, environment=fixture_env)
+        externals = qualify_externals(run, base, root, environment=fixture_env)
         packages = tomllib.loads((REPO / "Cargo.lock").read_text())["package"]
         pins = {name: next(item["version"] for item in packages if item["name"] == name)
                 for name in ("itoa", "memchr")}
@@ -481,7 +657,10 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False):
             while json.loads(run("clean"))["busy"]:
                 assert time.monotonic() < deadline
                 time.sleep(0.1)
-        # Native uv/Bun manage their own cached payloads. Lock/argument generations
+        tool_reuse = qualify_tool_reuse(run, base, root, binary=binary, config=config,
+                                       tools=tools, environment=fixture_env)
+        bounded_passes = qualify_bounded_passes(run, base, root, config, binary, fixture_env)
+        # Native uv/Bun manage their own cached payloads. Lock generations
         # retain old downloads while recently used, regardless of filesystem age.
         python = base / "python"
         python.mkdir()
@@ -493,7 +672,8 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False):
         (javascript / "package.json").write_text(json.dumps({"private": True, "dependencies": {"is-number": "7.0.0"}}))
         run("bun", "install", cwd=javascript)
         run("bun", "install", cwd=javascript)
-        shards = [path for tool in ("uv", "bun") for path in (root / tool).iterdir()]
+        shards = [path for tool in ("uv", "bun") for path in (root / tool).iterdir()
+                  if (path / ".lease").exists() and (path / ".last-use").exists()]
         def count(path):
             return sum(1 for item in (path / "cache").rglob('*') if item.is_file())
         for shard in shards:
@@ -505,13 +685,32 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False):
         assert [count(shard) for shard in shards] == before
         for shard in shards:
             (shard / ".last-use").write_text(str(old))
+        # A real but mismatched provider must fail, not become an incomplete
+        # successful pass or delete any idle native payload.
+        original_config = config.read_text()
+        invalid = json.loads(original_config)
+        invalid["uv"] = str(tools / "bun")
+        config.write_text(json.dumps(invalid))
+        try:
+            try:
+                run("clean", "--apply")
+            except RuntimeError as error:
+                assert "qualified version" in str(error)
+            else:
+                raise AssertionError("mismatched native provider unexpectedly accepted")
+            assert [count(shard) for shard in shards] == before
+        finally:
+            config.write_text(original_config)
         report = json.loads(run("clean", "--apply"))
+        assert report["scan_complete"] and not report["resumed"]
         after = [count(shard) for shard in shards]
         assert report["native_cache_runs"] >= len(shards) + 1
         assert sum(after) < sum(before)
         assert call([python / ".venv/bin/python", "-c", "import idna,sys;print(sys.version_info[:3])"]).strip() == "(3, 15, 1)"
         assert call([tools / "bun", "-e", 'console.log(require("is-number")(7))'], cwd=javascript).strip() == "true"
-        return {"cargo_cross_project_warm_hit": True, "rustup_cargo_routing": bool(rustup), "separate_final_binaries": True,
+        return {"bounded_collection": bounded_passes,
+                "external_subcommands": externals, "online_offline_tool_reuse": tool_reuse,
+                "cargo_cross_project_warm_hit": True, "rustup_cargo_routing": bool(rustup), "separate_final_binaries": True,
                 "caller_owned_inputs_preserved": True, "caller_targets": caller_targets,
                 "manifest_target_isolation": True, "native_and_wrapped_nested_builds": True,
                 "warm_use_refreshes_native_stamp": True, "stale_artifact_gc": True,
@@ -528,6 +727,9 @@ if __name__ == "__main__":
     parser.add_argument("--rustdoc", type=Path, required=True)
     parser.add_argument("--caller-targets-only", action="store_true",
                         help="run only real offline Cargo caller-target qualification in the owned fixture")
+    parser.add_argument("--tool-compatibility-only", action="store_true",
+                        help="qualify cold offline refusal and online-to-offline reuse with real uv/Bun")
     args = parser.parse_args()
     print(json.dumps(qualify(args.binary.resolve(), args.tools.resolve(), args.rustc.resolve(), args.rustdoc.resolve(),
-                             caller_targets_only=args.caller_targets_only)))
+                              caller_targets_only=args.caller_targets_only,
+                              tool_compatibility_only=args.tool_compatibility_only)))
