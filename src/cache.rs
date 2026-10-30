@@ -1263,6 +1263,7 @@ pub struct Report {
     pub busy: usize,
     pub unknown: usize,
     pub native_cache_runs: usize,
+    pub empty_units: usize,
     pub source_gc_deferred: bool,
     pub completed_uses: usize,
     pub scan_complete: bool,
@@ -1304,6 +1305,22 @@ impl Budget {
         self.start += start.elapsed();
         result
     }
+}
+
+/// uv leaves its stable native lock after cleaning a generation. Retain that
+/// lock and the generation ledger; an empty store has no payload to collect.
+fn uv_cache_empty(cache: &Dir, budget: &mut Budget) -> Result<bool> {
+    for entry in cache.entries()? {
+        budget.visit()?;
+        let entry = entry?;
+        if entry.file_name() != ".lock"
+            || !entry.file_type()?.is_file()
+            || entry.metadata()?.len() != 0
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 type ScanKey = Vec<String>;
@@ -1746,6 +1763,11 @@ impl ManagedCache {
                     scan.note(&key);
                     continue;
                 }
+                if tool == "uv" && uv_cache_empty(&cache_dir, &mut scan.budget)? {
+                    report.empty_units += 1;
+                    scan.note(&key);
+                    continue;
+                }
                 report.stale_units += 1;
                 if !apply {
                     scan.note(&key);
@@ -1923,6 +1945,26 @@ mod tests {
                 exit_code: Some(1)
             })
         ));
+    }
+    #[test]
+    fn empty_uv_detection_keeps_native_lock_identity_and_refuses_unknown_payload() {
+        let (temp, _) = fixture();
+        let dir = Dir::open_ambient_dir(temp.path(), ambient_authority()).unwrap();
+        assert!(uv_cache_empty(&dir, &mut Budget::new()).unwrap());
+        fs::write(temp.path().join(".lock"), b"").unwrap();
+        let before = fs::metadata(temp.path().join(".lock")).unwrap();
+        assert!(uv_cache_empty(&dir, &mut Budget::new()).unwrap());
+        let after = fs::metadata(temp.path().join(".lock")).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        fs::write(temp.path().join("payload"), b"keep").unwrap();
+        assert!(!uv_cache_empty(&dir, &mut Budget::new()).unwrap());
+        fs::remove_file(temp.path().join("payload")).unwrap();
+        fs::write(temp.path().join(".lock"), b"unknown").unwrap();
+        assert!(!uv_cache_empty(&dir, &mut Budget::new()).unwrap());
+        fs::remove_file(temp.path().join(".lock")).unwrap();
+        std::os::unix::fs::symlink("unknown", temp.path().join(".lock")).unwrap();
+        assert!(!uv_cache_empty(&dir, &mut Budget::new()).unwrap());
+        assert!(temp.path().join(".lock").is_symlink());
     }
     #[test]
     fn configured_idle_policy_collects_only_qualified_older_units() {

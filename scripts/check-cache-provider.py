@@ -447,12 +447,14 @@ def qualify_retention_policy(base, config, binary, environment):
     settings["retention_seconds"] = 86400
     path.write_text(json.dumps(settings))
     preview = json.loads(run("clean"))
-    assert preview["stale_units"] == len(managed) and preview["retention_seconds"] == 86400
+    assert preview["stale_units"] == len(managed) - 1 and preview["retention_seconds"] == 86400
+    assert preview["empty_units"] == 1
     assert all((shard / ".last-use").read_text() == str(old) for shard in shards)
     applied = json.loads(run("clean", "--apply", "--passes", "32"))
     assert applied["scan_complete"]
     report = applied["passes"][-1]
-    assert report["retention_seconds"] == 86400 and report["native_cache_runs"] == len(managed) + 1
+    assert report["retention_seconds"] == 86400 and report["native_cache_runs"] == len(managed)
+    assert report["empty_units"] == 1
     run("uv", "--version")
     recent = json.loads(run("clean", "--apply"))
     assert recent["completed_uses"] == 1 and recent["stale_units"] == len(managed) - 1
@@ -462,7 +464,8 @@ def qualify_retention_policy(base, config, binary, environment):
     assert future["stale_units"] == 0
     return {"configured_seconds": 86400, "legacy_default_preserved": True,
             "completed_use_and_future_time_preserved": True, "preview_is_read_only": True,
-            "native_one_day_gc_tools": [*managed, "cargo"],
+            "native_one_day_gc_tools": [*(tool for tool in managed if tool != "uv"), "cargo"],
+            "uv_empty_generation_preserved_without_gc": True,
             "bun_collection": "qualified" if sys.platform == "linux" else "deferred"}
 
 
@@ -964,7 +967,8 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
             events=[json.loads(line) for line in run("cargo","build","--manifest-path",str(app / "Cargo.toml"),"--message-format=json").splitlines() if line.startswith('{')]
             targets.append(next(item["executable"] for item in events if item.get("executable")))
         assert targets[0]!=targets[1]
-        # Both native-Cargo and wrapped-Cargo build-script recursion are qualified.
+        # Successful native recursion is distinct from actual managed placement.
+        nested_placement = {}
         for mode in ("native","wrapped"):
             child=base / ("nested-child-"+mode)
             parent=base / ("nested-parent-"+mode)
@@ -975,8 +979,15 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
             prefix='std::env::var_os("CARGO").unwrap()' if mode=="native" else json.dumps(str(binary))
             arguments=[] if mode=="native" else [str(config),"cargo"]
             arguments += ["build","--manifest-path",str(child / "Cargo.toml")]
-            (parent / "build.rs").write_text('fn main(){let status=std::process::Command::new('+prefix+').args(['+','.join(json.dumps(arg) for arg in arguments)+']).status().unwrap();assert!(status.success());}\n')
+            run("cargo", "generate-lockfile", "--offline", cwd=child)
+            metadata = (arguments[:2] if mode == "wrapped" else []) + ["metadata", "--locked", "--offline", "--no-deps", "--format-version", "1", "--manifest-path", str(child / "Cargo.toml")]
+            receipt = parent / "nested-placement.json"
+            (parent / "build.rs").write_text('fn main(){let output=std::process::Command::new('+prefix+').args(['+','.join(json.dumps(arg) for arg in metadata)+']).output().unwrap();assert!(output.status.success());std::fs::write('+json.dumps(str(receipt))+',output.stdout).unwrap();let status=std::process::Command::new('+prefix+').args(['+','.join(json.dumps(arg) for arg in arguments)+']).status().unwrap();assert!(status.success());}\n')
             run("cargo","build",cwd=parent)
+            actual = json.loads(receipt.read_text())
+            nested_placement[mode] = {key: Path(actual[key]).is_relative_to(root) for key in ("target_directory", "build_directory")}
+            if mode == "wrapped":
+                assert all(nested_placement[mode].values()), "explicit frontend descendant escaped managed placement"
         run("clean","--apply")
         for path in (external_target,external_build):
             assert (path / "preserve").read_text()=="caller-owned"
@@ -1061,7 +1072,7 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
         assert report["scan_complete"] and not report["resumed"]
         after = [count(shard) for shard in shards]
         qualified_shards = [p for p in shards if p.parent.name != "bun" or sys.platform == "linux"]
-        assert report["native_cache_runs"] >= len(qualified_shards) + 1
+        assert report["native_cache_runs"] + report["empty_units"] >= len(qualified_shards) + 1
         assert any(not item.exists() for item in native_payloads)
         if sys.platform != "linux":
             assert all(after[index] == before[index] for index, shard in enumerate(shards)
@@ -1080,6 +1091,7 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
                 "cargo_cross_project_warm_hit": True, "rustup_cargo_routing": bool(rustup), "separate_final_binaries": True,
                 "caller_owned_inputs_preserved": True, "caller_targets": caller_targets,
                 "manifest_target_isolation": True, "native_and_wrapped_nested_builds": True,
+                "nested_cargo_effective_placement": nested_placement,
                 "warm_use_refreshes_native_stamp": True, "stale_artifact_gc": True,
                 "native_source_gc": True, "native_child_lease_survives_parent": True,
                 "uv_idle_generation_gc": True,
