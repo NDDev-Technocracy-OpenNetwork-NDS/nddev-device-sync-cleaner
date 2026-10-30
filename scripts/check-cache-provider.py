@@ -222,7 +222,8 @@ fn reads_current_checkout() {
         assert (case / "parent-depth").read_text() == "0"
         assert Path((case / "parent-out").read_text()).is_relative_to(parent_build)
         parent_parts = parent_build.relative_to(root / "cargo/lanes").parts
-        assert len(parent_parts) == 2 and parent_parts[1] == "build"
+        assert len(parent_parts) == 4 and parent_parts[1] == "targets" and parent_parts[3] == "cache"
+        assert parent_build == parent_target
         assert parent_target.relative_to(root / "cargo/lanes").parts[1] == "targets"
         # Context is deliberately distinct from effective-path retention proof.
         assert (parent_target.parent / ".last-use").exists() == (not options)
@@ -234,9 +235,9 @@ fn reads_current_checkout() {
                                           "--format-version", "1", cwd=child, overrides=inherited))
             build_parts = Path(metadata["build_directory"]).relative_to(root / "cargo/lanes").parts
             target_parts = Path(metadata["target_directory"]).relative_to(root / "cargo/lanes").parts
-            assert len(build_parts) == 5 and build_parts[1:4] == ("build", "nested", str(depth))
             assert len(target_parts) == 4 and target_parts[1] == "targets" and target_parts[3] == "cache"
-            assert build_parts[0] == target_parts[0] == parent_parts[0] and build_parts[4] == target_parts[2]
+            assert build_parts == target_parts and build_parts[0] == parent_parts[0]
+            assert metadata["build_directory"] not in paths and Path(metadata["build_directory"]) != parent_build
             paths.append(metadata["build_directory"])
             # Repeat actual observed native placement as inherited protocol
             # context; this is not a claim of eight recursive compiler builds.
@@ -840,9 +841,156 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
             "busy_preview_preserves_records": True, "next_complete_pass_succeeds": True}
 
 
-def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_compatibility_only=False, native_locks_only=False):
+def qualify_output_boundary(run, base, root, binary, config, environment):
+    """Real concurrent compilers, transitive rustdoc, warm reuse and native leases."""
+    work = base / "output-boundary"
+    leaf, middle = work / "leaf", work / "middle"
+    for path, dependencies, body in (
+        (leaf, '', 'pub struct Number(pub u64); pub fn number()->Number { Number(7) }\n'),
+        (middle, '[dependencies]\nleaf={path="../leaf"}\n',
+         'pub fn number()->leaf::Number { leaf::number() }\n'),
+    ):
+        (path / "src").mkdir(parents=True)
+        (path / "Cargo.toml").write_text(
+            f'[package]\nname="{path.name}"\nversion="0.0.0"\nedition="2024"\n' + dependencies)
+        (path / "src/lib.rs").write_text(body)
+    apps, metadata, locks = [], [], []
+    for label in ("a", "b"):
+        app = work / label
+        (app / "src").mkdir(parents=True)
+        (app / "Cargo.toml").write_text(
+            f'[package]\nname="output-{label}"\nversion="0.0.0"\nedition="2024"\n'
+            '[dependencies]\nmiddle={path="../middle"}\n')
+        (app / "src/lib.rs").write_text(
+            '//! ```\n//! assert_eq!(middle::number().0, 7);\n//! ```\n'
+            'pub fn number()->u64 { middle::number().0 }\n')
+        (app / "build.rs").write_text('''fn main() {
+    println!("cargo::rerun-if-changed=build.rs");
+    std::fs::write("ready", b"ready").unwrap();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !std::path::Path::new("release").exists() {
+        assert!(std::time::Instant::now() < end, "owned fixture gate expired");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+''')
+        run("cargo", "generate-lockfile", "--offline", cwd=app)
+        locks.append((app / "Cargo.lock").read_bytes())
+        metadata.append(json.loads(run("cargo", "metadata", "--locked", "--offline", "--no-deps",
+                                       "--format-version", "1", cwd=app)))
+        apps.append(app)
+    builds = [Path(item["build_directory"]) for item in metadata]
+    targets = [Path(item["target_directory"]) for item in metadata]
+    assert builds == targets and builds[0] != builds[1]
+    assert all(path.is_relative_to(root / "cargo/lanes") for path in builds)
+    children, logs = [], []
+    try:
+        for app in apps:
+            log = tempfile.TemporaryFile(mode="w+")
+            logs.append(log)
+            children.append(subprocess.Popen(
+                [str(binary), str(config), "cargo", "build", "--locked", "--offline", "--message-format=json"],
+                cwd=app, env=environment, stdout=log, stderr=log, start_new_session=True))
+        deadline = time.monotonic() + 15
+        while not all((app / "ready").exists() for app in apps):
+            for child, log in zip(children, logs):
+                if child.poll() is not None:
+                    log.seek(0)
+                    raise AssertionError(log.read())
+            assert time.monotonic() < deadline, "independent native output owners could not progress concurrently"
+            time.sleep(0.02)
+        # Both build scripts have actually started while holding their native
+        # Cargo output locks. The shared lifetime lease still blocks collection.
+        busy = json.loads(run("clean"))
+        assert busy["busy"] >= 1
+        for build in builds:
+            exclusive = False
+            for name in (".cargo-lock", ".cargo-build-lock"):
+                path = build / "debug" / name
+                if not path.exists():
+                    continue
+                with path.open("r+") as native_lock:
+                    try:
+                        fcntl.flock(native_lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        exclusive = True
+            assert exclusive, "native workspace build lock is not exclusive"
+        for app in apps:
+            (app / "release").touch()
+        for child, log in zip(children, logs):
+            assert child.wait(timeout=15) == 0
+            log.seek(0)
+            events = [json.loads(line) for line in log if line.startswith('{')]
+            artifacts = [item for item in events if item.get("reason") == "compiler-artifact"]
+            assert artifacts and not next(item for item in artifacts if item["target"]["name"] == "middle")["fresh"]
+        for app, build, lock in zip(apps, builds, locks):
+            result = run("cargo", "test", "--locked", "--offline", "--doc", cwd=app)
+            assert "1 passed" in result
+            events = [json.loads(line) for line in run("cargo", "build", "--locked", "--offline",
+                                                     "--message-format=json", cwd=app).splitlines() if line.startswith('{')]
+            artifacts = [item for item in events if item.get("reason") == "compiler-artifact"]
+            assert artifacts and all(item["fresh"] for item in artifacts)
+            assert all(Path(name).is_relative_to(build) for item in artifacts for name in item["filenames"])
+            assert (app / "Cargo.lock").read_bytes() == lock
+            assert not (app / "target").exists()
+            assert (build.parent / ".pending-use").read_bytes() == b"1"
+        completed = json.loads(run("clean", "--apply"))
+        assert completed["completed_uses"] >= 2
+        assert all(not (build.parent / ".pending-use").exists() for build in builds)
+        # Keep real legacy-unit GC covered without enabling it for concurrent
+        # default work. Both calls are sequential, in this disposable root.
+        legacy = builds[0].parents[2] / "build"
+        legacy_events = []
+        for app in apps:
+            target_id = hashlib.sha256(("legacy-" + str(app)).encode()).hexdigest()
+            target = builds[0].parents[2] / "targets" / target_id / "cache"
+            output = run("cargo", "-Zfine-grain-locking", "build", "--locked", "--offline",
+                         "--message-format=json", cwd=app,
+                         overrides={"CARGO_BUILD_BUILD_DIR": str(legacy), "CARGO_TARGET_DIR": str(target)})
+            events = [json.loads(line) for line in output.splitlines() if line.startswith('{')]
+            legacy_events.append(next(item for item in events if item.get("reason") == "compiler-artifact"
+                                      and item["target"]["name"] == "middle"))
+        assert not legacy_events[0]["fresh"] and legacy_events[1]["fresh"]
+        shared_library = Path(legacy_events[1]["filenames"][0])
+        shared_stamp = shared_library.parent.parent / "fingerprint/lib-middle"
+        assert shared_stamp.is_file()
+        unknown = legacy / "debug/build/middle/not-a-unit/preserve"
+        unknown.parent.mkdir(parents=True)
+        unknown.write_bytes(b"unqualified layout stays owned")
+        run("clean", "--apply")  # Native completion acknowledges pending uses.
+        old = int(time.time()) - RETENTION - 10
+        (builds[0].parent / ".last-use").write_text(str(old))
+        leaf_stamp = next(legacy.glob("debug/build/leaf/*/fingerprint/lib-leaf"))
+        os.utime(leaf_stamp, (old, old))
+        current = {name: hashlib.sha256(Path(name).read_bytes()).hexdigest()
+                   for item in artifacts for name in item["filenames"] if name.endswith(".rlib")}
+        assert current
+        preview = json.loads(run("clean"))
+        assert preview["stale_units"] >= 2 and leaf_stamp.exists() and builds[0].exists()
+        collected = json.loads(run("clean", "--apply"))
+        assert collected["removed_units"] >= 2 and not leaf_stamp.exists() and not builds[0].exists()
+        assert shared_stamp.exists() and unknown.read_bytes() == b"unqualified layout stays owned"
+        assert all(hashlib.sha256(Path(path).read_bytes()).hexdigest() == value for path, value in current.items())
+    finally:
+        for app in apps:
+            (app / "release").touch()
+        for child in children:
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGINT)
+                child.wait(timeout=30)
+        for log in logs:
+            log.close()
+    return {"independent_workspaces_progress_concurrently": True,
+            "native_busy_lease_and_completed_use": True, "transitive_doctest": True,
+            "same_workspace_warm_hit": True, "cross_workspace_compiled_hit": False,
+            "shared_source_home": True, "original_locks_and_checkout_placement_preserved": True,
+            "legacy_opt_in_reuse_and_unit_gc": True,
+            "default_target_gc_and_unknown_current_preservation": True}
+
+
+def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_compatibility_only=False, native_locks_only=False, output_boundary_only=False):
     versions = json.loads((REPO / "cache-providers.lock.json").read_text())["versions"]
-    for name, expected in ({"cargo": versions["cargo"]} if caller_targets_only else versions).items():
+    for name, expected in ({"cargo": versions["cargo"]} if caller_targets_only or output_boundary_only else versions).items():
         reported = call([tools / name, "--version"]).strip()
         assert (reported.split(" (")[0] if name == "uv" else reported) == expected
     with tempfile.TemporaryDirectory(prefix="nds-cache-acceptance-") as temporary:
@@ -881,6 +1029,9 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
                                       tools=tools, environment=fixture_env)
         if native_locks_only:
             return qualify_native_owner_locks(base, config, binary, fixture_env)
+        if output_boundary_only:
+            return qualify_output_boundary(run, base, root, binary, config, fixture_env)
+        output_boundary = qualify_output_boundary(run, base, root, binary, config, fixture_env)
         externals = qualify_externals(run, base, root, environment=fixture_env)
         packages = tomllib.loads((REPO / "Cargo.lock").read_text())["package"]
         pins = {name: next(item["version"] for item in packages if item["name"] == name)
@@ -900,8 +1051,13 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
             (app / "src/main.rs").write_text(f'fn main(){{println!("{label} {{}}",nds_cache_shared_dep::value());}}\n')
             apps.append(app)
         def build(app):
-            return [json.loads(line) for line in run("cargo", "build", "--message-format=json", cwd=app).splitlines()
+            # Retain real legacy-layout GC/reuse coverage. This explicit fixture
+            # is sequential; it is not the current default/concurrency contract.
+            return [json.loads(line) for line in run("cargo", "-Zfine-grain-locking", "build", "--message-format=json", cwd=app,
+                                                   overrides={"CARGO_BUILD_BUILD_DIR": str(legacy_build)}).splitlines()
                     if line.startswith('{')]
+        selected = json.loads(run("cargo", "metadata", "--no-deps", "--format-version", "1", cwd=apps[0]))
+        legacy_build = Path(selected["target_directory"]).parents[2] / "build"
         first = build(apps[0])
         stamp = next(root.glob("cargo/lanes/*/build/debug/build/nds-cache-shared-dep/*/fingerprint/lib-nds_cache_shared_dep"))
         old = int(time.time()) - RETENTION - 10
@@ -913,7 +1069,7 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
             shim = base / "frontends/rustup"
             assert call([shim, "run", "1.99.1", "cargo", "--version"], environment=fixture_env).strip() == versions["cargo"]
             assert call([shim, "which", "--toolchain", "1.99.1", "rustc"], environment=fixture_env) == call([rustup, "which", "--toolchain", "1.99.1", "rustc"], environment=fixture_env)
-            events = [json.loads(line) for line in call([shim, "run", "1.99.1", "cargo", "build", "--locked", "--message-format=json"], cwd=apps[1], environment=fixture_env).splitlines() if line.startswith('{')]
+            events = [json.loads(line) for line in call([shim, "run", "1.99.1", "cargo", "-Zfine-grain-locking", "build", "--locked", "--message-format=json"], cwd=apps[1], environment=dict(fixture_env, CARGO_BUILD_BUILD_DIR=str(legacy_build))).splitlines() if line.startswith('{')]
             assert next(item for item in events if item.get("target", {}).get("name") == "nds_cache_shared_dep")["fresh"]
         executables = [Path(next(item["executable"] for item in events if item.get("executable")))
                        for events in (first, second)]
@@ -1088,7 +1244,8 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
                 "uv_environment_placement": placement,
                 "configured_retention": configured_retention, "bounded_collection": bounded_passes,
                 "external_subcommands": externals, "online_offline_tool_reuse": tool_reuse,
-                "cargo_cross_project_warm_hit": True, "rustup_cargo_routing": bool(rustup), "separate_final_binaries": True,
+                "cargo_output_boundary": output_boundary, "legacy_opt_in_cross_project_warm_hit": True,
+                "rustup_cargo_routing": bool(rustup), "separate_final_binaries": True,
                 "caller_owned_inputs_preserved": True, "caller_targets": caller_targets,
                 "manifest_target_isolation": True, "native_and_wrapped_nested_builds": True,
                 "nested_cargo_effective_placement": nested_placement,
@@ -1111,8 +1268,11 @@ if __name__ == "__main__":
                         help="qualify cold offline refusal and online-to-offline reuse with real uv/Bun")
     parser.add_argument("--native-locks-only", action="store_true",
                         help="exercise real raw Cargo/uv lock contention in the owned fixture")
+    parser.add_argument("--output-boundary-only", action="store_true",
+                        help="exercise real concurrent workspace outputs, rustdoc, warm reuse and leases")
     args = parser.parse_args()
     print(json.dumps(qualify(args.binary.resolve(), args.tools.resolve(), args.rustc.resolve(), args.rustdoc.resolve(),
                               caller_targets_only=args.caller_targets_only,
                               tool_compatibility_only=args.tool_compatibility_only,
-                              native_locks_only=args.native_locks_only)))
+                              native_locks_only=args.native_locks_only,
+                              output_boundary_only=args.output_boundary_only)))
