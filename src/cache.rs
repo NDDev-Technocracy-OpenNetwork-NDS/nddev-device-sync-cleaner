@@ -107,6 +107,13 @@ pub enum CacheError {
     Budget,
     #[error("cache provider is unavailable or differs from its qualified version")]
     Provider,
+    #[error("{provider} {operation} failed: {reason} (exit {exit_code:?})")]
+    Native {
+        provider: &'static str,
+        operation: &'static str,
+        reason: &'static str,
+        exit_code: Option<i32>,
+    },
     #[error("cache filesystem operation failed")]
     Io,
 }
@@ -262,8 +269,55 @@ fn initialize_directory(dir: &Dir) -> Result<()> {
     }
     Ok(())
 }
+// Probe the native owner's actual lock, including writers which predate the
+// frontend. Never retain these locks while spawning the native GC itself.
+fn native_locks_available(dir: &Dir, names: &[&str]) -> Result<bool> {
+    let mut guards = Vec::new();
+    for name in names {
+        let metadata = match dir.symlink_metadata(name) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            result => result?,
+        };
+        if !metadata.is_file() || metadata.is_symlink() {
+            return Err(CacheError::Ownership);
+        }
+        let file = dir
+            .open_with(name, OpenOptions::new().read(true).write(true))?
+            .into_std();
+        match rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => guards.push(file),
+            Err(rustix::io::Errno::WOULDBLOCK) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(true)
+}
+
+fn observe_native_use(dir: &Dir, current: u64, apply: bool) -> Result<()> {
+    if !apply {
+        return Ok(());
+    }
+    match dir.symlink_metadata(".pending-use") {
+        Ok(_) => {
+            if regular(dir, Path::new(".pending-use"), 1)? != b"1" {
+                return Err(CacheError::Ownership);
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // An observed native writer is real use. Completion is acknowledged
+            // later, after both the frontend and the native owner are idle.
+            record_use(dir, current.max(last_use(dir)?))?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
 fn use_cache(dir: &Dir) -> Result<()> {
     let current = now()?;
+    record_use(dir, current)
+}
+fn record_use(dir: &Dir, current: u64) -> Result<()> {
     let temporary = format!(
         ".use-{}-{}",
         std::process::id(),
@@ -662,12 +716,43 @@ impl ManagedCache {
         arguments: Vec<OsString>,
         cwd: Option<PathBuf>,
     ) -> Result<Vec<u8>> {
+        let actual = if executable == Path::new("/usr/bin/env") {
+            arguments.get(1).map(Path::new).unwrap_or(executable)
+        } else {
+            executable
+        };
+        let provider = if actual == self.config.cargo {
+            "cargo"
+        } else if self.config.uv.as_deref() == Some(actual) {
+            "uv"
+        } else if self.config.bun.as_deref() == Some(actual) {
+            "bun"
+        } else if actual == self.config.rustc {
+            "rustc"
+        } else {
+            "native"
+        };
+        let operation = if arguments.iter().any(|a| a == "--version" || a == "-vV") {
+            "version"
+        } else if arguments.iter().any(|a| a == "gc") {
+            "source_gc"
+        } else if arguments.iter().any(|a| a == "clean" || a == "prune") {
+            "cache_gc"
+        } else {
+            "probe"
+        };
+        let failure = |reason, exit_code| CacheError::Native {
+            provider,
+            operation,
+            reason,
+            exit_code,
+        };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|_| CacheError::Provider)?;
+            .map_err(|_| failure("runtime", None))?;
         let io = NativeIo::new(1)
-            .map_err(|_| CacheError::Provider)?
+            .map_err(|error| failure(error.code(), None))?
             .process_handle();
         let output = rt
             .block_on(io.process(
@@ -680,9 +765,9 @@ impl ManagedCache {
                 },
                 CancellationToken::new(),
             ))
-            .map_err(|_| CacheError::Provider)?;
+            .map_err(|error| failure(error.code(), None))?;
         if !output.status.success() {
-            return Err(CacheError::Provider);
+            return Err(failure("exit", output.status.code()));
         }
         Ok(output.stdout)
     }
@@ -1627,6 +1712,20 @@ impl ManagedCache {
                     scan.note(&key);
                     continue;
                 }
+                let cache_dir = match directory(&shard, Path::new("cache")) {
+                    Ok(dir) => dir,
+                    Err(_) => {
+                        report.unknown += 1;
+                        scan.note(&key);
+                        continue;
+                    }
+                };
+                if tool == "uv" && !native_locks_available(&cache_dir, &[".lock"])? {
+                    observe_native_use(&shard, current, apply)?;
+                    report.busy += 1;
+                    scan.note(&key);
+                    continue;
+                }
                 if scan
                     .budget
                     .effect(|| completed_use(&shard, current, apply))?
@@ -1673,8 +1772,22 @@ impl ManagedCache {
                         (scan.retention.as_secs() / 86_400).to_string().into(),
                     ]
                 });
-                scan.budget
-                    .effect(|| self.native(Path::new("/usr/bin/env"), args, None))?;
+                match scan
+                    .budget
+                    .effect(|| self.native(Path::new("/usr/bin/env"), args, None))
+                {
+                    Ok(_) => {}
+                    Err(CacheError::Native {
+                        reason: "timeout", ..
+                    }) if tool == "uv" && !native_locks_available(&cache_dir, &[".lock"])? => {
+                        observe_native_use(&shard, current, apply)?;
+                        report.stale_units -= 1;
+                        report.busy += 1;
+                        scan.note(&key);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
                 report.native_cache_runs += 1;
                 scan.note(&key);
                 // Keep ledger and native Bun store links. No raw cache tree removal.
@@ -1684,9 +1797,17 @@ impl ManagedCache {
             report.source_gc_deferred = true;
             return Ok(());
         }
+        let cargo_home = self.cargo_home()?;
+        let home = Dir::open_ambient_dir(&cargo_home, ambient_authority())?;
+        let locks = &[".package-cache", ".package-cache-mutate"];
+        if !native_locks_available(&home, locks)? {
+            report.busy += 1;
+            report.source_gc_deferred = true;
+            return Ok(());
+        }
         scan.budget.visit()?;
         let mut env = OsString::from("CARGO_HOME=");
-        env.push(self.cargo_home()?);
+        env.push(cargo_home);
         let mut args = vec![
             env,
             self.config.cargo.as_os_str().to_owned(),
@@ -1706,7 +1827,17 @@ impl ManagedCache {
         if !apply {
             args.push("--dry-run".into());
         }
-        self.native(Path::new("/usr/bin/env"), args, None)?;
+        match self.native(Path::new("/usr/bin/env"), args, None) {
+            Ok(_) => {}
+            Err(CacheError::Native {
+                reason: "timeout", ..
+            }) if !native_locks_available(&home, locks)? => {
+                report.busy += 1;
+                report.source_gc_deferred = true;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
         report.native_cache_runs += 1;
         Ok(())
     }
@@ -1777,6 +1908,21 @@ mod tests {
         assert!(!expired(100, 86_500, one_day));
         assert!(expired(100, 86_501, one_day));
         assert!(!expired(100, 99, one_day));
+    }
+    #[test]
+    fn native_failure_keeps_provider_operation_and_exit_category() {
+        let (_temp, mut config) = fixture();
+        config.cargo = "/usr/bin/false".into();
+        let cache = ManagedCache::initialize(config).unwrap();
+        assert!(matches!(
+            cache.collect(false),
+            Err(CacheError::Native {
+                provider: "cargo",
+                operation: "version",
+                reason: "exit",
+                exit_code: Some(1)
+            })
+        ));
     }
     #[test]
     fn configured_idle_policy_collects_only_qualified_older_units() {
