@@ -152,3 +152,14 @@ native failures retain their provider, operation, reason and exit category.
 No provider argv, private paths or raw provider output is rendered in that error.
 The process timeout and scan budgets are unchanged and do not establish a
 shorter consumer RPC deadline.
+
+The existing main workflow also retains `nds-cache-native-Linux-X64` and
+`nds-cache-native-macOS-ARM64` archives after actual native release-binary
+qualification. Each contains a separately pinned compatible alpha.5 execution
+binary and current alpha.6 maintenance binary, their source commits, the native
+frontend helper, tool/compiler identities, license and ordinary `SHA256SUMS`
+inside a tar archive that preserves native executable modes.
+These are finite CI artifacts, not an installed selection or host acceptance.
+Consumers preserve verified bytes under their existing artifact pin before
+expiry and qualify their own configuration, policy, jobs and rollback. Windows
+module tests do not qualify managed-cache deployment on Windows.
