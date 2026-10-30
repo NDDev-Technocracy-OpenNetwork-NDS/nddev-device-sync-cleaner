@@ -22,6 +22,24 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(target_os = "linux")]
+mod bun_guard;
+
+const BUN_LIFETIME: &[u8] = b"NDS Bun descendant guard v1\n";
+const ENVIRONMENTS: &[u8] = b"NDS installed project environments v1\n";
+
+// An inherited fd alone is insufficient: Bun closes it before launching some
+// descendants. Old generations and interrupted guards remain unqualified.
+fn bun_completed(dir: &Dir) -> Result<bool> {
+    if regular(dir, Path::new(".bun-lifetime"), BUN_LIFETIME.len())? != BUN_LIFETIME {
+        return Ok(false);
+    }
+    Ok(directory(dir, Path::new(".bun-runs"))?
+        .entries()?
+        .next()
+        .is_none())
+}
+
 pub const RETENTION: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 const MARKER: &[u8] = b"NDS managed rebuildable cache v1\n";
 fn qualified(name: &str) -> Result<String> {
@@ -66,6 +84,7 @@ pub struct Config {
     pub bun: Option<PathBuf>,
     pub scan_entries: Option<usize>,
     pub retention_seconds: Option<u64>,
+    pub environment_root: Option<PathBuf>,
 }
 
 impl Config {
@@ -128,6 +147,7 @@ pub fn read_config(path: &Path) -> Result<Config> {
             .chain(config.cargo_home.iter())
             .chain(config.uv.iter())
             .chain(config.bun.iter())
+            .chain(config.environment_root.iter())
             .any(|p| !p.is_absolute())
     {
         return Err(CacheError::Configuration);
@@ -340,7 +360,7 @@ fn fallback_toolchain(cwd: &Path, release: &str, host: &str) -> Result<()> {
     Ok(())
 }
 
-fn tool_generation(tool: &str, cwd: &Path, args: &[OsString], current: u64) -> Result<String> {
+fn tool_directory(tool: &str, cwd: &Path, args: &[OsString]) -> Result<PathBuf> {
     let mut working = if tool == "uv" {
         std::env::var_os("UV_WORKING_DIR").map(PathBuf::from)
     } else {
@@ -378,7 +398,11 @@ fn tool_generation(tool: &str, cwd: &Path, args: &[OsString], current: u64) -> R
         }
     }
     let working = fs::canonicalize(cwd.join(working.unwrap_or_default()))?;
-    let selected = fs::canonicalize(working.join(project.unwrap_or_default()))?;
+    Ok(fs::canonicalize(working.join(project.unwrap_or_default()))?)
+}
+
+fn tool_generation(tool: &str, cwd: &Path, args: &[OsString], current: u64) -> Result<String> {
+    let selected = tool_directory(tool, cwd, args)?;
     let lock = if tool == "uv" { "uv.lock" } else { "bun.lock" };
     let mut workspace = selected.clone();
     let mut locked = None;
@@ -408,7 +432,11 @@ fn tool_generation(tool: &str, cwd: &Path, args: &[OsString], current: u64) -> R
     // v2 is a separate namespace: never copy/adopt a v1 payload or alter its
     // lease or last-use markers. Native providers own package/ABI/index keys;
     // presentation, offline mode and command argv are not compatibility keys.
-    let mut identity = b"NDS native tool cache generation v2\0".to_vec();
+    let mut identity = if tool == "bun" {
+        b"NDS native Bun descendant cache generation v3\0".to_vec()
+    } else {
+        b"NDS native tool cache generation v2\0".to_vec()
+    };
     for part in [
         tool.as_bytes(),
         qualified(tool)?.as_bytes(),
@@ -459,6 +487,119 @@ fn external_command(args: &[OsString]) -> Option<(usize, &str)> {
 }
 
 impl ManagedCache {
+    fn environments(config: &Config, initialize: bool) -> Result<Option<Dir>> {
+        let Some(path) = &config.environment_root else {
+            return Ok(None);
+        };
+        // Installed environments are not cache payloads and cannot be nested in
+        // the collector's root. Same-device placement preserves native links.
+        if !path.is_absolute() || path.starts_with(&config.root) || config.root.starts_with(path) {
+            return Err(CacheError::Configuration);
+        }
+        if initialize && !path.exists() {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(path)?;
+        }
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_dir()
+            || metadata.is_symlink()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o077 != 0
+            || fs::canonicalize(path)? != *path
+            || metadata.dev() != fs::metadata(&config.root)?.dev()
+        {
+            return Err(CacheError::Ownership);
+        }
+        let dir = Dir::open_ambient_dir(path, ambient_authority())?;
+        if initialize && dir.entries()?.next().is_none() {
+            let mut marker = dir.open_with(
+                ".nds-environments",
+                OpenOptions::new().write(true).create_new(true),
+            )?;
+            marker.write_all(ENVIRONMENTS)?;
+            marker.sync_all()?;
+        }
+        if regular(&dir, Path::new(".nds-environments"), ENVIRONMENTS.len())? != ENVIRONMENTS {
+            return Err(CacheError::Ownership);
+        }
+        Ok(Some(dir))
+    }
+
+    fn uv_environment(
+        &self,
+        executable: &Path,
+        cwd: &Path,
+        args: &[OsString],
+    ) -> Result<Option<PathBuf>> {
+        let Some(environment_root) = &self.config.environment_root else {
+            return Ok(None);
+        };
+        if std::env::var_os("UV_PROJECT_ENVIRONMENT").is_some()
+            || args.iter().take_while(|a| a.as_os_str() != "--").any(|a| {
+                a == "--active"
+                    || a == "--no-project"
+                    || a == "--script"
+                    || a == "-s"
+                    || a.to_str().is_some_and(|s| s.starts_with("--script="))
+            })
+        {
+            return Ok(None);
+        }
+        let mut arguments = args.iter();
+        let command = loop {
+            let Some(argument) = arguments.next().and_then(|a| a.to_str()) else {
+                return Ok(None);
+            };
+            if matches!(
+                argument,
+                "--directory" | "--project" | "--config-file" | "--color" | "--allow-insecure-host"
+            ) {
+                arguments.next();
+            } else if !argument.starts_with('-') {
+                break argument;
+            }
+        };
+        if !matches!(command, "run" | "sync" | "add" | "remove") {
+            return Ok(None);
+        }
+        // Ask uv itself, without resolving dependencies or touching the lock.
+        // Non-project invocations retain their native behavior.
+        let selected = tool_directory("uv", cwd, args)?;
+        let Ok(output) = self.native(
+            executable,
+            vec![
+                "workspace".into(),
+                "dir".into(),
+                "--offline".into(),
+                "--directory".into(),
+                selected.clone().into_os_string(),
+                "--project".into(),
+                selected.into_os_string(),
+            ],
+            Some(cwd.to_owned()),
+        ) else {
+            return Ok(None);
+        };
+        let workspace = PathBuf::from(
+            String::from_utf8(output)
+                .map_err(|_| CacheError::Configuration)?
+                .trim_end_matches('\n'),
+        );
+        if !workspace.is_absolute() || fs::canonicalize(&workspace)? != workspace {
+            return Err(CacheError::Configuration);
+        }
+        let mut identity = b"NDS native project environment v1\0".to_vec();
+        identity.extend_from_slice(workspace.as_os_str().as_encoded_bytes());
+        let name = digest(&identity);
+        let environments =
+            Self::environments(&self.config, false)?.ok_or(CacheError::Configuration)?;
+        environments.create_dir_all(&name)?;
+        let _ = directory(&environments, Path::new(&name))?;
+        Ok(Some(environment_root.join(name).join("venv")))
+    }
+
     pub fn initialize(config: Config) -> Result<Self> {
         if !config.root.exists() {
             fs::DirBuilder::new()
@@ -495,6 +636,7 @@ impl ManagedCache {
         for tool in ["uv", "bun"] {
             dir.create_dir(tool)?;
         }
+        Self::environments(&config, true)?;
         Self::open(config)
     }
     pub fn open(config: Config) -> Result<Self> {
@@ -511,6 +653,7 @@ impl ManagedCache {
         if regular(&root, Path::new(".nds-cache"), MARKER.len())? != MARKER {
             return Err(CacheError::Ownership);
         }
+        Self::environments(&config, false)?;
         Ok(Self { config, root })
     }
     fn native(
@@ -981,7 +1124,9 @@ impl ManagedCache {
         Err(command.exec().into())
     }
 
-    pub fn run_tool(&self, tool: &str, args: &[OsString]) -> Result<()> {
+    pub fn run_tool(&self, config_path: &Path, tool: &str, args: &[OsString]) -> Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = config_path;
         let (executable, variable) = match tool {
             "uv" => (self.config.uv.as_ref(), "UV_CACHE_DIR"),
             "bun" => (self.config.bun.as_ref(), "BUN_INSTALL_CACHE_DIR"),
@@ -1002,21 +1147,24 @@ impl ManagedCache {
         let _lease = lease(&shard, false, true)?;
         use_cache(&shard)?;
         shard.create_dir_all("cache")?;
-        Err(self
-            .command(
-                executable,
-                vec![(
-                    variable.into(),
-                    self.config
-                        .root
-                        .join(shard_path)
-                        .join("cache")
-                        .into_os_string(),
-                )],
-                args,
-            )
-            .exec()
-            .into())
+        #[cfg(target_os = "linux")]
+        if tool == "bun" {
+            return self.bun_guard(config_path, &shard_path, &shard, args);
+        }
+        let mut environment = vec![(
+            variable.into(),
+            self.config
+                .root
+                .join(shard_path)
+                .join("cache")
+                .into_os_string(),
+        )];
+        if tool == "uv"
+            && let Some(path) = self.uv_environment(executable, &cwd, args)?
+        {
+            environment.push(("UV_PROJECT_ENVIRONMENT".into(), path.into_os_string()));
+        }
+        Err(self.command(executable, environment, args).exec().into())
     }
 }
 
@@ -1474,6 +1622,11 @@ impl ManagedCache {
                     }
                     Err(error) => return Err(error),
                 };
+                if tool == "bun" && !bun_completed(&shard).unwrap_or(false) {
+                    report.unknown += 1;
+                    scan.note(&key);
+                    continue;
+                }
                 if scan
                     .budget
                     .effect(|| completed_use(&shard, current, apply))?
@@ -1582,6 +1735,7 @@ mod tests {
                 bun: None,
                 scan_entries: None,
                 retention_seconds: None,
+                environment_root: None,
             },
         )
     }

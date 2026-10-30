@@ -1,6 +1,6 @@
 [package]
 name = "nddev-device-sync-cleaner"
-version = "0.0.1-alpha.4"
+version = "0.0.1-alpha.5"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
@@ -18,7 +18,7 @@ thiserror = "2"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 cap-std = "=4.0.3"
-rustix = { version = "=1.1.5", features = ["fs", "process"] }
+rustix = { version = "=1.1.5", features = ["event", "fs", "process", "stdio"] }
 sha2 = "0.11"
 tokio = { version = "1", features = ["rt"] }
 toml = "1.1.8"
