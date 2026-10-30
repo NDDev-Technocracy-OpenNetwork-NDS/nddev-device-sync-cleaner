@@ -17,7 +17,8 @@ fn run() {
             .ok_or("usage: nds-cleaner-cache CONFIG init|cargo|uv|bun|clean [--apply]")?;
         let operation = args.next().ok_or("missing operation")?;
         let args: Vec<_> = args.collect();
-        let config = read_config(std::path::Path::new(&config)).map_err(|e| e.to_string())?;
+        let config_path = std::path::PathBuf::from(config);
+        let config = read_config(&config_path).map_err(|e| e.to_string())?;
         if operation == "init" && args.is_empty() {
             ManagedCache::initialize(config).map_err(|e| e.to_string())?;
             println!("{{\"initialized\":true}}");
@@ -26,7 +27,11 @@ fn run() {
         let cache = ManagedCache::open(config).map_err(|e| e.to_string())?;
         match operation.to_str() {
             Some("cargo") => cache.run_cargo(&args),
-            Some("uv" | "bun") => cache.run_tool(operation.to_str().unwrap_or_default(), &args),
+            Some("uv" | "bun") => {
+                cache.run_tool(&config_path, operation.to_str().unwrap_or_default(), &args)
+            }
+            #[cfg(target_os = "linux")]
+            Some("bun-guard") => cache.run_bun_guard(&args),
             Some("clean") => {
                 let (apply, passes, batch) = match args.as_slice() {
                     [] => (false, 1, false),

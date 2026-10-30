@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real native cache qualification, entirely inside an owned temporary fixture."""
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -434,8 +435,9 @@ def qualify_retention_policy(base, config, binary, environment):
     run("uv", "--version")
     run("bun", "--version")
     observed = json.loads(run("clean", "--apply"))
-    assert observed["retention_seconds"] == RETENTION and observed["completed_uses"] == 2
-    shards = [p for tool in ("uv", "bun") for p in (root / tool).iterdir()]
+    managed = ("uv", "bun") if sys.platform == "linux" else ("uv",)
+    assert observed["retention_seconds"] == RETENTION and observed["completed_uses"] == len(managed)
+    shards = [p for tool in managed for p in (root / tool).iterdir()]
     old = int(time.time()) - 2 * 86400
     for shard in shards:
         assert not (shard / ".pending-use").exists()
@@ -445,22 +447,182 @@ def qualify_retention_policy(base, config, binary, environment):
     settings["retention_seconds"] = 86400
     path.write_text(json.dumps(settings))
     preview = json.loads(run("clean"))
-    assert preview["stale_units"] == 2 and preview["retention_seconds"] == 86400
+    assert preview["stale_units"] == len(managed) and preview["retention_seconds"] == 86400
     assert all((shard / ".last-use").read_text() == str(old) for shard in shards)
     applied = json.loads(run("clean", "--apply", "--passes", "32"))
     assert applied["scan_complete"]
     report = applied["passes"][-1]
-    assert report["retention_seconds"] == 86400 and report["native_cache_runs"] == 3
+    assert report["retention_seconds"] == 86400 and report["native_cache_runs"] == len(managed) + 1
     run("uv", "--version")
     recent = json.loads(run("clean", "--apply"))
-    assert recent["completed_uses"] == 1 and recent["stale_units"] == 1
+    assert recent["completed_uses"] == 1 and recent["stale_units"] == len(managed) - 1
     for shard in shards:
         (shard / ".last-use").write_text(str(int(time.time()) + 3600))
     future = json.loads(run("clean"))
     assert future["stale_units"] == 0
     return {"configured_seconds": 86400, "legacy_default_preserved": True,
             "completed_use_and_future_time_preserved": True, "preview_is_read_only": True,
-            "real_uv_bun_and_cargo_one_day_gc": True}
+            "native_one_day_gc_tools": [*managed, "cargo"],
+            "bun_collection": "qualified" if sys.platform == "linux" else "deferred"}
+
+
+def qualify_bun_descendants(base, config, binary, environment):
+    """Real Bun closes inherited fds; the owned subreaper must still guard them."""
+    if sys.platform != "linux":
+        return {"collection": "deferred", "reason": "native_descendant_scope_not_qualified"}
+    project = base / "bun-descendants"
+    project.mkdir()
+    root = base / "bun-descendant-cache"
+    path = base / "bun-descendant-config.json"
+    settings = dict(json.loads(config.read_text()), root=str(root), frontends=None,
+                    cargo_home=None, retention_seconds=86400)
+    path.write_text(json.dumps(settings))
+    call([binary, path, "init"], cwd=project, environment=environment)
+
+    def collect():
+        report = json.loads(call([binary, path, "clean", "--apply"],
+                                 cwd=project, environment=environment))
+        assert report["scan_complete"]
+        return report
+
+    def until(predicate):
+        deadline = time.monotonic() + 15
+        while not predicate():
+            assert time.monotonic() < deadline, "owned native descendant did not finish"
+            time.sleep(0.01)
+
+    def available(shard):
+        with (shard / ".lease").open("r+b") as stream:
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            return True
+
+    def launch(label):
+        ready, done = project / (label + ".json"), project / (label + ".done")
+        child = ("import os,pathlib,json,time;pathlib.Path(" + repr(str(ready)) + ")"
+                 ".write_text(json.dumps({'pid':os.getpid(),'guard':os.getppid(),"
+                 "'cache':os.environ['BUN_INSTALL_CACHE_DIR']}));time.sleep(3);"
+                 "pathlib.Path(" + repr(str(done)) + ").touch()")
+        script = ("const c=Bun.spawn(" + json.dumps([sys.executable, "-c", child])
+                  + ',{stdio:["ignore","ignore","ignore"]});c.unref();process.exit(17);')
+        start = time.monotonic()
+        result = subprocess.run([str(binary), str(path), "bun", "-e", script], cwd=project,
+                                env=environment, capture_output=True, timeout=15)
+        assert result.returncode == 17, (result.stdout, result.stderr)
+        assert time.monotonic() - start < 2, "foreground exit waited for background child"
+        until(ready.exists)
+        assert not done.exists()
+        receipt = json.loads(ready.read_text())
+        shard = Path(receipt["cache"]).parent
+        assert shard.is_relative_to(root / "bun")
+        assert not available(shard), "Bun descendant lost native guard lease"
+        assert list((shard / ".bun-runs").iterdir())
+        return receipt, shard, done
+
+    first, shard, done = launch("first")
+    second, same, other_done = launch("concurrent")
+    assert same == shard
+    assert len(list((shard / ".bun-runs").iterdir())) == 2
+    assert collect()["busy"] >= 1
+    until(lambda: done.exists() and other_done.exists() and available(shard))
+    assert not list((shard / ".bun-runs").iterdir())
+    assert collect()["completed_uses"] == 1
+    receipt, shard, done = launch("interrupted")
+    # Only this fixture's guard is signalled; its child exits naturally.
+    status = Path(f"/proc/{receipt['pid']}/status").read_text()
+    guard = int(next(line.split()[1] for line in status.splitlines() if line.startswith("PPid:")))
+    command = Path(f"/proc/{guard}/cmdline").read_bytes().split(b"\0")
+    assert command[1:3] == [os.fsencode(path), b"bun-guard"]
+    os.kill(guard, signal.SIGKILL)
+    until(lambda: done.exists() and available(shard))
+    pending = (shard / ".pending-use").read_bytes()
+    old = str(int(time.time()) - 7 * 86400)
+    (shard / ".last-use").write_text(old)
+    report = collect()
+    assert report["unknown"] >= 1 and report["completed_uses"] == 0
+    assert (shard / ".last-use").read_text() == old
+    assert (shard / ".pending-use").read_bytes() == pending
+    assert list((shard / ".bun-runs").iterdir())
+    # A legacy generation has no descendant proof and must not be acknowledged.
+    legacy = root / "bun" / hashlib.sha256(b"legacy Bun fixture").hexdigest()
+    legacy.mkdir()
+    (legacy / ".lease").touch()
+    (legacy / ".last-use").write_text(old)
+    (legacy / ".pending-use").write_bytes(b"1")
+    report = collect()
+    assert report["unknown"] >= 2
+    assert (legacy / ".last-use").read_text() == old
+    assert (legacy / ".pending-use").read_bytes() == b"1"
+    return {"parent_status_preserved": True, "foreground_returns_before_descendant": True,
+            "concurrent_descendants_guarded": True, "completion_after_all_descendants": True,
+            "interrupted_guard_remains_unknown": True, "legacy_bun_retained": True}
+
+
+def qualify_uv_placement(base, config, binary, environment, source=None):
+    """Installed environments stay outside GC while uv keeps native hardlinks."""
+    root, environments = base / "placement-cache", base / "installed-environments"
+    project = source if source is not None else base / "placement-project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        '[project]\nname="native-placement"\nversion="0.0.0"\n'
+        'requires-python=">=3.15"\ndependencies=["idna==3.10"]\n')
+    settings = dict(json.loads(config.read_text()), root=str(root), frontends=None,
+                    cargo_home=None, retention_seconds=86400, environment_root=str(environments))
+    path = base / "placement-config.json"
+    path.write_text(json.dumps(settings))
+    native = Path(settings["uv"])
+    call([native, "sync", "--python", "3.15.1", "--no-python-downloads",
+          "--cache-dir", base / "previous-cache"], cwd=project, environment=environment)
+    previous = project / ".venv"
+    probe = ["python", "-c", "import idna,json,sys;print(json.dumps({'prefix':sys.prefix,'module':idna.__file__}))"]
+    old_module = Path(json.loads(call([previous / "bin/python", *probe[1:]], environment=environment))["module"])
+    old_hash = hashlib.sha256(old_module.read_bytes()).hexdigest()
+    lock = (project / "uv.lock").read_bytes()
+
+    def run(*arguments, cwd=project, overrides=None):
+        return call([binary, path, *arguments], cwd=cwd, environment=dict(environment, **(overrides or {})))
+
+    run("init")
+    try:
+        run("uv", "sync", "--locked", "--offline", "--python", "3.15.1", "--no-python-downloads")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("empty managed cache unexpectedly satisfied cold offline install")
+    run("uv", "sync", "--locked", "--python", "3.15.1", "--no-python-downloads")
+    result = json.loads(run("uv", "run", "--locked", "--offline", *probe))
+    installed = Path(result["prefix"])
+    module = Path(result["module"])
+    assert installed.is_relative_to(environments) and installed != previous
+    assert module.stat().st_dev == root.stat().st_dev
+    candidates = root.glob("uv/*/cache/archive-v*/**/idna/__init__.py")
+    assert any((item.stat().st_dev, item.stat().st_ino) == (module.stat().st_dev, module.stat().st_ino)
+               for item in candidates), "native uv did not retain its hardlink backend"
+    selected = json.loads(run("uv", "--directory", project, "run", "--offline", *probe))
+    assert selected["prefix"] == str(installed)
+    active = json.loads(run("uv", "run", "--active", "--offline", *probe,
+                            overrides={"VIRTUAL_ENV": str(previous)}))
+    assert active["prefix"] == str(previous)
+    explicit = base / "explicit-environment"
+    chosen = json.loads(run("uv", "run", "--offline", *probe,
+                            overrides={"UV_PROJECT_ENVIRONMENT": str(explicit)}))
+    assert chosen["prefix"] == str(explicit)
+    assert (project / "uv.lock").read_bytes() == lock
+    assert hashlib.sha256(old_module.read_bytes()).hexdigest() == old_hash
+    report = json.loads(run("clean", "--apply"))
+    assert report["completed_uses"] == 1
+    for shard in (root / "uv").iterdir():
+        (shard / ".last-use").write_text(str(int(time.time()) - 2 * 86400))
+    report = json.loads(run("clean", "--apply"))
+    assert report["native_cache_runs"] == 2
+    assert module.is_file() and hashlib.sha256(old_module.read_bytes()).hexdigest() == old_hash
+    assert json.loads(call([installed / "bin/python", *probe[1:]], environment=environment))["prefix"] == str(installed)
+    return {"new_environment_on_cache_device": True, "native_hardlink_observed": True,
+            "explicit_and_active_environments_preserved": True, "original_environment_unchanged": True,
+            "installed_environment_survives_native_gc": True, "lock_unchanged": True,
+            "source_on_different_device": project.stat().st_dev != root.stat().st_dev}
 
 
 def qualify_bounded_passes(run, base, root, config, binary, environment):
@@ -747,19 +909,25 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
         report = json.loads(run("clean", "--apply"))
         assert report["scan_complete"] and not report["resumed"]
         after = [count(shard) for shard in shards]
-        assert report["native_cache_runs"] >= len(shards) + 1
+        qualified_shards = [p for p in shards if p.parent.name != "bun" or sys.platform == "linux"]
+        assert report["native_cache_runs"] >= len(qualified_shards) + 1
         assert sum(after) < sum(before)
         assert call([python / ".venv/bin/python", "-c", "import idna,sys;print(sys.version_info[:3])"]).strip() == "(3, 15, 1)"
         assert call([tools / "bun", "-e", 'console.log(require("is-number")(7))'], cwd=javascript).strip() == "true"
         configured_retention = qualify_retention_policy(base, config, binary, fixture_env)
-        return {"configured_retention": configured_retention, "bounded_collection": bounded_passes,
+        descendants = qualify_bun_descendants(base, config, binary, fixture_env)
+        placement = qualify_uv_placement(base, config, binary, fixture_env)
+        return {"bun_descendant_lifetime": descendants,
+                "uv_environment_placement": placement,
+                "configured_retention": configured_retention, "bounded_collection": bounded_passes,
                 "external_subcommands": externals, "online_offline_tool_reuse": tool_reuse,
                 "cargo_cross_project_warm_hit": True, "rustup_cargo_routing": bool(rustup), "separate_final_binaries": True,
                 "caller_owned_inputs_preserved": True, "caller_targets": caller_targets,
                 "manifest_target_isolation": True, "native_and_wrapped_nested_builds": True,
                 "warm_use_refreshes_native_stamp": True, "stale_artifact_gc": True,
                 "native_source_gc": True, "native_child_lease_survives_parent": True,
-                "uv_bun_idle_generation_gc": True, "installed_environments_preserved": True,
+                "uv_idle_generation_gc": True,
+                "bun_idle_generation_gc": sys.platform == "linux", "installed_environments_preserved": True,
                 "retention_seconds": RETENTION, "versions": versions}
 
 

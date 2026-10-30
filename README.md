@@ -36,18 +36,24 @@ symlink traversal. Cargo's native `clean gc -Zgc` owns source/archive/index/Git
 cleanup with all five age limits set to three days. An optional existing native
 Cargo home keeps its own credentials, installed programs and native cache locks.
 
-uv and Bun generation v2 is identified by the qualified provider version,
+uv generation v2 and Bun generation v3 are identified by the qualified provider version,
 OS/architecture, canonical workspace and exact nearest `uv.lock` or `bun.lock`.
 Offline/presentation flags and other command argv do not create a new store;
 native uv/Bun own package, interpreter/ABI and index compatibility inside it.
 Native directory/project selectors and uv's corresponding environment select
 the workspace; selectors after `--` belong to the called program. Unlocked
 operations use daily generations. Arguments and lock content are never
-journaled. Old v1 generations keep their own leases/use records and age out
-normally; no cache copies, timestamp rewriting or installed-environment migration
-is performed. Each generation has an inherited lease. Cleanup observes
-completed foreground use under an exclusive lease before starting its three-day
-idle period, so a long-running command cannot become immediately stale on exit.
+journaled. No cache copies, timestamp rewriting or installed-environment migration is
+performed. uv retains an inherited lease. Linux Bun uses an owned native
+subreaper guard because Bun can close inherited descriptors before launching
+descendants. Foreground exit status returns immediately; the guard holds a
+shared lease until all its descendants finish, including detached children.
+A durable per-invocation pending record survives guard failure and prevents
+collection. The guard waits for child exits without scanning or signalling
+other processes. Legacy Bun generations and platforms without a qualified
+descendant scope are retained as unknown. Cleanup observes completed use under
+an exclusive lease before starting the configured idle period, so a long-running
+command cannot become immediately stale on exit.
 A regular hourly maintenance pass bounds this conservative observation delay.
 uv's native cache clean and Bun's native age prune own payload removal; Bun keeps
 its native store links. Installed environments, runtimes and live data stay with
@@ -62,11 +68,18 @@ installation. No nightly Rust compiler is installed.
 
 Supply a private JSON file with `schema: 1`, absolute `root`, `cargo`, `rustc`,
 `rustdoc`, and optional `rustup`, `rustup_home`, `cargo_home`, `frontends`, `uv`,
-`bun` paths. The root must be canonical, user-owned and mode 0700. Initialization
+`bun` paths, plus an optional `environment_root`. The root must be canonical, user-owned and mode 0700. Initialization
 requires an empty directory and creates an ownership marker. Existing caches are
 not silently adopted. Optional `scan_entries` can lower the default 100,000-entry
 pass budget to pace maintenance; values outside 1..100,000 are rejected. Very
 small budgets may not reach an atomic unit. This never raises the discovery bound.
+`environment_root` is an explicitly initialized, private installed-environment
+store outside the collector root and on the same filesystem. For project
+`uv run/sync/add/remove`, native `uv workspace dir --offline` selects a distinct
+workspace environment there. Existing `.venv` directories are preserved. Explicit
+`UV_PROJECT_ENVIRONMENT`, `--active`, scripts and non-project commands retain
+their native ownership. Installed environments are never cache garbage.
+
 Provider binary paths come from the verified installation;
 `frontends` selects a dedicated local tool prefix. Generate its argv-preserving
 Cargo/uv/Bun wrappers with `scripts/install-cache-frontends.py CONFIG BINARY`;
