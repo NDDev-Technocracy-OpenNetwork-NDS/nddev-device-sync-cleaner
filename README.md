@@ -121,6 +121,18 @@ nds-cleaner-cache /operator/config/cache.json clean --apply
 nds-cleaner-cache /operator/config/cache.json clean --apply --passes 32
 ```
 
+Select one profile per host from a verified `nds-cache-native-<os>-<arch>` CI
+artifact with `scripts/select-profile.py --artifact DIR --base-profile JSON`.
+It verifies `SHA256SUMS`, installs the execution (frontend) and maintenance
+(collector) binaries by source commit, writes one new profile with
+`retention_seconds` (default 86400) instead of editing a live one, generates the
+frontends, and renders the shell selector plus the scheduler (systemd user timer
+or launchd agent). `--collector` keeps collecting retained legacy roots and
+`--manager-path` replaces managed frontend prefixes in the systemd user manager
+`PATH`. It previews by default; `--apply` backs up every replaced file, writes a
+receipt for the estate record and runs a first collection preview, and
+`--rollback RECEIPT` restores the previous selection without deleting anything.
+
 `clean` defaults to preview. JSON reports distinguish stale/removed native units,
 native GC calls, active leases and completed-use observations. `empty_units`
 counts expired uv generations with no entries except an optional empty regular
