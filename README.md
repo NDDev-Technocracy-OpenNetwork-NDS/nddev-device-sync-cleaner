@@ -68,7 +68,10 @@ an exclusive lease before starting the configured idle period, so a long-running
 command cannot become immediately stale on exit.
 A regular hourly maintenance pass bounds this conservative observation delay.
 uv's native cache clean and Bun's native age prune own payload removal; Bun keeps
-its native store links. Installed environments, runtimes and live data stay with
+its native store links. The managed `uv`/`bun` frontends therefore refuse native
+cache commands and `--cache-dir` overrides with an explicit message that names
+`nds-cleaner-cache CONFIG clean`; arguments after `--` still belong to the called
+program. Installed environments, runtimes and live data stay with
 their native owners. Filesystem modification time alone never establishes shard
 inactivity.
 
