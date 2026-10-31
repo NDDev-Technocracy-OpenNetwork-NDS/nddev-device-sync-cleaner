@@ -43,6 +43,14 @@ class Fixture:
                                          "frontends": str(self.home / ".local/share/nds/profiles/legacy/bin")}))
         self.selector = self.home / ".config/nds/development-profile.sh"
         self.selector.write_text("# legacy selector\n")
+        legacy = self.home / ".local/share/nds/profiles/legacy/bin"
+        legacy.mkdir(parents=True)
+        legacy_cleaner = self.home / ".local/share/nds/cleaner" / ("a" * 40) / "nds-cleaner-cache"
+        (legacy / ".nds-cache-frontends").write_text("1\n")
+        (legacy / "cargo").write_text(f"#!/bin/sh\n{select.MARKER}exec {legacy_cleaner} {self.base} cargo \"$@\"\n")
+        (legacy / "python3").write_text('#!/bin/sh\nexec /usr/bin/true "$@"\n')
+        (legacy / "tsc").write_text(f'#!/bin/sh\nexec {legacy_cleaner} {self.base} bun /opt/typescript/bin/tsc "$@"\n')
+        self.legacy = legacy
         self.calls = []
 
     def write_sums(self):
@@ -102,8 +110,16 @@ class SelectProfile(unittest.TestCase):
         self.assertIn(f"cleaner/{MAINTENANCE}/nds-cleaner-cache {profile} clean --apply --passes 32", service)
         self.assertTrue(any(c[:3] == ["systemctl", "--user", "set-environment"] and
                             c[3].startswith(f"PATH={data['frontends']}:") and "legacy" not in c[3] for c in self.fx.calls))
+        frontends = Path(data["frontends"])
+        self.assertEqual((frontends / "python3").read_text(), (self.fx.legacy / "python3").read_text())
+        tsc = (frontends / "tsc").read_text()
+        self.assertIn(f"exec {self.fx.home}/.local/share/nds/cleaner/{EXECUTION}/nds-cleaner-cache {profile} bun "
+                      "/opt/typescript/bin/tsc", tsc)
+        self.assertNotIn("legacy", tsc)
+        self.assertNotIn("a" * 40, tsc)
         receipt_path = next((self.fx.home / ".local/state/nds/cleaner-selection").glob("*/receipt.json"))
         receipt = json.loads(receipt_path.read_text())
+        self.assertEqual(sorted(receipt["companions"]), ["python3", "tsc"])
         self.assertEqual(receipt["roles"]["maintenance"]["source"], MAINTENANCE)
         self.assertEqual(receipt["first_preview"], {"role": "maintenance"})
         with mock.patch("sys.stdout"):
@@ -125,6 +141,28 @@ class SelectProfile(unittest.TestCase):
         with mock.patch("sys.stdout"):
             self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base),
                          "--collector", str(source))
+
+    def test_companions_that_cannot_be_retargeted_are_refused(self):
+        other = self.fx.home / "other"
+        other.mkdir()
+        (other / "node").write_text(f'#!/bin/sh\nexec {self.fx.home}/.local/share/nds/profiles/x/bin/bun "$@"\n')
+        with self.assertRaisesRegex(ValueError, "cannot be retargeted"):
+            self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base),
+                         "--companions-from", str(other))
+        (other / "node").write_text('#!/bin/sh\nexec /nonexistent/node "$@"\n')
+        with self.assertRaisesRegex(ValueError, "missing program"):
+            self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base),
+                         "--companions-from", str(other))
+        (other / "node").write_text('#!/bin/sh\nexec /usr/bin/env "$@"\n')
+        (other / "python3").write_text('#!/bin/sh\nexec /usr/bin/env python3 "$@"\n')
+        with self.assertRaisesRegex(ValueError, "python3 differs"):
+            self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base),
+                         "--companions-from", str(other))
+
+    def test_macos_selector_raises_the_descriptor_soft_limit(self):
+        selector = select.render_selector("/p.json", "0" * 64, "/e", "1" * 64, "/f", None, darwin=True)
+        self.assertIn("ulimit -n 8192", selector)
+        self.assertNotIn("ulimit", select.render_selector("/p.json", "0" * 64, "/e", "1" * 64, "/f", None))
 
     def test_retention_must_be_whole_days(self):
         with self.assertRaisesRegex(ValueError, "whole days"):

@@ -129,7 +129,13 @@ It verifies `SHA256SUMS`, installs the execution (frontend) and maintenance
 frontends, and renders the shell selector plus the scheduler (systemd user timer
 or launchd agent). `--collector` keeps collecting retained legacy roots and
 `--manager-path` replaces managed frontend prefixes in the systemd user manager
-`PATH`. It previews by default; `--apply` backs up every replaced file, writes a
+`PATH`. Host toolchain shims that the estate installer placed beside the managed
+frontends (interpreters, compilers, TypeScript) are carried from the base
+profile and every `--companions-from` directory into the new frontends, a shim
+that runs through the Cleaner is retargeted to the new binary and profile, and
+any other managed reference is refused, so a selection never drops a command
+from `PATH`. On macOS the selector raises the descriptor soft limit to 8192 for
+native Cargo locks. It previews by default; `--apply` backs up every replaced file, writes a
 receipt for the estate record and runs a first collection preview, and
 `--rollback RECEIPT` restores the previous selection without deleting anything.
 
