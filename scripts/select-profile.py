@@ -3,7 +3,7 @@
 
 usage:
   select-profile.py --artifact DIR --base-profile JSON [--retention SECONDS]
-                    [--collector JSON ...] [--manager-path] [--apply]
+                    [--collector JSON ...] [--companions-from DIR ...] [--manager-path] [--apply]
   select-profile.py --rollback RECEIPT [--apply]
 
 The artifact is the extracted `nds-cache-native-<os>-<arch>` CI output: its
@@ -15,6 +15,14 @@ argv-preserving wrappers. The shell selector and the scheduler (a systemd user
 service/timer on Linux, a launchd agent on macOS) then name that one profile.
 Additional `--collector` configs keep collecting retained legacy roots or a
 separate Cargo home on the same root.
+
+The frontend directory of the base profile, and of every `--companions-from`
+directory, may also hold host toolchain shims that the estate installer placed
+next to the managed frontends (interpreters, compilers, TypeScript). They are
+carried into the new frontend directory so selecting a profile never drops a
+command from PATH. A shim that runs through the Cleaner is retargeted to the new
+execution binary and profile; any other reference to a managed profile, binary
+or configuration is refused.
 
 Without --apply nothing is written; the plan is printed. --apply backs up every
 replaced file under ~/.local/state/nds/cleaner-selection/<stamp>/ and writes a
@@ -38,6 +46,10 @@ import tempfile
 LABEL = "ai.nddev.nds.development-cache"
 UNIT = "nds-development-cache"
 HEX = re.compile(r"[0-9a-f]{40}")
+MARKER = "# NDS managed development cache frontend\n"
+MANAGED = re.compile(r"/\.local/share/nds/(cleaner|profiles)/|/\.config/nds/development-cache/")
+THROUGH_CLEANER = re.compile(r"(?m)^(exec )(\S+/\.local/share/nds/cleaner/[0-9a-f]{40}/nds-cleaner-cache) "
+                             r"(\S+/\.config/nds/development-cache/[^/\s]+\.json) ")
 
 
 def sha256(path):
@@ -84,7 +96,36 @@ def paths(home, profile_id, roles):
     }
 
 
-def render_selector(profile_path, profile_sha, execution, execution_sha, frontends, rustup_home):
+def companions(sources, execution, profile):
+    """Host toolchain shims beside the managed frontends, retargeted to `execution` and `profile`."""
+    found = {}
+    for source in sources:
+        for entry in sorted(source.iterdir()):
+            if entry.name == ".nds-cache-frontends" or entry.name.startswith("."):
+                continue
+            if entry.is_symlink() or not entry.is_file():
+                raise ValueError(f"companion {entry} is not a regular file")
+            text = entry.read_text()
+            if MARKER in text:
+                continue  # a managed frontend; the artifact's installer renders it again
+            if not text.startswith("#!/bin/sh\n"):
+                raise ValueError(f"companion {entry} is not a POSIX shell shim")
+            text = THROUGH_CLEANER.sub(lambda m: m[1] + shlex.quote(str(execution)) + " "
+                                       + shlex.quote(str(profile)) + " ", text)
+            if MANAGED.search(THROUGH_CLEANER.sub("", text)):
+                raise ValueError(f"companion {entry} names a managed path it cannot be retargeted from")
+            for line in text.splitlines():
+                if line.startswith("exec "):
+                    target = shlex.split(line)[1]
+                    if target != str(execution) and target.startswith("/") and not os.access(target, os.X_OK):
+                        raise ValueError(f"companion {entry} runs a missing program {target}")
+            if found.get(entry.name, (None, text))[1] != text:
+                raise ValueError(f"companion {entry.name} differs between {found[entry.name][0]} and {source}")
+            found.setdefault(entry.name, (source, text))
+    return found
+
+
+def render_selector(profile_path, profile_sha, execution, execution_sha, frontends, rustup_home, darwin=False):
     lines = [
         "# NDS development tools; private generated binding",
         "# Inherit bindings maintained by the native network-cache client.",
@@ -109,6 +150,11 @@ def render_selector(profile_path, profile_sha, execution, execution_sha, fronten
         f"export NDS_CLEANER_BIN_SHA256={execution_sha}",
         f"export NDS_CLEANER_CONFIG_SHA256={profile_sha}",
     ]
+    if darwin:
+        # Fine-grained native Cargo locks exceed the default macOS soft descriptor limit.
+        lines += ["nds_profile_nofile=$(ulimit -n)",
+                  'case "$nds_profile_nofile" in unlimited) ;; *) [ "$nds_profile_nofile" -ge 8192 ] || ulimit -n 8192 ;; esac',
+                  "unset nds_profile_nofile"]
     if rustup_home:
         lines.append(f"export RUSTUP_HOME={shlex.quote(str(rustup_home))}")
     return "\n".join(lines) + "\n"
@@ -174,9 +220,13 @@ def plan(args, run):
             raise ValueError(f"collector {c} must be a distinct schema-1 root or Cargo home")
     system = platform.system()
     maintenance = p["binary"]["maintenance"]
+    sources = [Path(d).resolve(strict=True) for d in args.companions_from]
+    if base.get("frontends") and Path(base["frontends"]).is_dir():
+        sources.insert(0, Path(base["frontends"]).resolve())
+    shims = companions(dict.fromkeys(s for s in sources if s != p["frontends"]), p["binary"]["execution"], p["profile"])
     files = {"selector": render_selector(p["profile"], hashlib.sha256(profile_text.encode()).hexdigest(),
                                          p["binary"]["execution"], roles["execution"]["sha256"], p["frontends"],
-                                         profile.get("rustup_home"))}
+                                         profile.get("rustup_home"), system == "Darwin")}
     if system == "Linux":
         files["service"] = render_service(maintenance, [p["profile"], *collectors])
         files["timer"] = TIMER
@@ -195,7 +245,7 @@ def plan(args, run):
             manager_path = {"before": line[5:], "after": ":".join([str(p["frontends"]), *parts])}
     return {"home": home, "artifact": artifact, "profile_id": profile_id, "paths": p, "profile_text": profile_text,
             "files": files, "collectors": collectors, "system": system, "manager_path": manager_path,
-            "base": base_path}
+            "base": base_path, "companions": shims}
 
 
 def apply(selection, run):
@@ -219,6 +269,14 @@ def apply(selection, run):
     if not p["profile"].exists():
         atomic_write(p["profile"], selection["profile_text"], 0o600)
     run([sys.executable, str(selection["artifact"]["frontend_installer"]), str(p["profile"]), str(p["binary"]["execution"])])
+    carried = {}
+    for name, (source, text) in selection["companions"].items():
+        target = p["frontends"] / name
+        if target.exists() and (target.is_symlink() or target.read_text() != text):
+            raise ValueError(f"a different {name} already exists in the selected frontends")
+        if not target.exists():
+            atomic_write(target, text, 0o755)
+        carried[name] = {"source": str(source / name), "sha256": sha256(target)}
     previous = {}
     for key, content in selection["files"].items():
         target = p[key]
@@ -241,7 +299,7 @@ def apply(selection, run):
         "roles": {role: {"source": d["source"], "sha256": d["sha256"], "path": str(p["binary"][role])}
                   for role, d in roles.items()},
         "frontends": str(p["frontends"]), "collectors": [str(c) for c in selection["collectors"]],
-        "replaced": previous, "manager_path": selection["manager_path"],
+        "companions": carried, "replaced": previous, "manager_path": selection["manager_path"],
         "first_preview": json.loads(preview) if preview.strip().startswith("{") else preview.strip()[:2000],
     }
     atomic_write(state / "receipt.json", json.dumps(receipt, indent=1) + "\n", 0o600)
@@ -291,6 +349,8 @@ def main(argv=None, run=runner):
     parser.add_argument("--base-profile")
     parser.add_argument("--retention", type=int, default=86400)
     parser.add_argument("--collector", action="append", default=[])
+    parser.add_argument("--companions-from", action="append", default=[],
+                        help="another frontend directory whose host toolchain shims are carried over")
     parser.add_argument("--manager-path", action="store_true",
                         help="replace managed frontend prefixes in the systemd user manager PATH (Linux)")
     parser.add_argument("--home", default=str(Path.home()))
@@ -307,6 +367,7 @@ def main(argv=None, run=runner):
                "profile": str(selection["paths"]["profile"]), "frontends": str(selection["paths"]["frontends"]),
                "roles": {r: d["source"] for r, d in selection["artifact"]["roles"].items()},
                "writes": sorted(selection["files"]), "collectors": [str(c) for c in selection["collectors"]],
+               "companions": {n: str(s / n) for n, (s, _) in selection["companions"].items()},
                "manager_path": selection["manager_path"], "applied": False}
     if not args.apply:
         print(json.dumps(summary, indent=1))
