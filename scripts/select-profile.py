@@ -13,7 +13,8 @@ the frontends and the maintenance binary runs collection. One new profile JSON
 root paths, sets `retention_seconds` and points `frontends` at the new
 argv-preserving wrappers. The shell selector and the scheduler (a systemd user
 service/timer on Linux, a launchd agent on macOS) then name that one profile.
-Additional `--collector` configs keep collecting retained legacy roots.
+Additional `--collector` configs keep collecting retained legacy roots or a
+separate Cargo home on the same root.
 
 Without --apply nothing is written; the plan is printed. --apply backs up every
 replaced file under ~/.local/state/nds/cleaner-selection/<stamp>/ and writes a
@@ -168,8 +169,9 @@ def plan(args, run):
     collectors = [Path(c).resolve(strict=True) for c in args.collector]
     for c in collectors:
         data = json.loads(c.read_text())
-        if data.get("schema") != 1 or data.get("root") == profile["root"]:
-            raise ValueError(f"collector {c} must be a distinct schema-1 root")
+        same = (data.get("root"), data.get("cargo_home")) == (profile["root"], profile.get("cargo_home"))
+        if data.get("schema") != 1 or same:
+            raise ValueError(f"collector {c} must be a distinct schema-1 root or Cargo home")
     system = platform.system()
     maintenance = p["binary"]["maintenance"]
     files = {"selector": render_selector(p["profile"], hashlib.sha256(profile_text.encode()).hexdigest(),

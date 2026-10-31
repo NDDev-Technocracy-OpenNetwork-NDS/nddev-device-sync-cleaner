@@ -114,6 +114,18 @@ class SelectProfile(unittest.TestCase):
         self.assertTrue(any(c[:3] == ["systemctl", "--user", "set-environment"] and "legacy" in c[3]
                             for c in self.fx.calls))
 
+    def test_collector_must_differ_by_root_or_cargo_home(self):
+        same = self.fx.home / "same.json"
+        same.write_text(self.fx.base.read_text())
+        with self.assertRaisesRegex(ValueError, "distinct schema-1 root or Cargo home"):
+            self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base),
+                         "--collector", str(same))
+        source = self.fx.home / "source.json"
+        source.write_text(json.dumps(dict(json.loads(self.fx.base.read_text()), cargo_home="/srv/cargo/home")))
+        with mock.patch("sys.stdout"):
+            self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base),
+                         "--collector", str(source))
+
     def test_retention_must_be_whole_days(self):
         with self.assertRaisesRegex(ValueError, "whole days"):
             self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base),
