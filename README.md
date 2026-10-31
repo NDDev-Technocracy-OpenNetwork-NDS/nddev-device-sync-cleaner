@@ -68,7 +68,10 @@ an exclusive lease before starting the configured idle period, so a long-running
 command cannot become immediately stale on exit.
 A regular hourly maintenance pass bounds this conservative observation delay.
 uv's native cache clean and Bun's native age prune own payload removal; Bun keeps
-its native store links. Installed environments, runtimes and live data stay with
+its native store links. The managed `uv`/`bun` frontends therefore refuse native
+cache commands and `--cache-dir` overrides with an explicit message that names
+`nds-cleaner-cache CONFIG clean`; arguments after `--` still belong to the called
+program. Installed environments, runtimes and live data stay with
 their native owners. Filesystem modification time alone never establishes shard
 inactivity.
 
@@ -117,6 +120,18 @@ nds-cleaner-cache /operator/config/cache.json clean
 nds-cleaner-cache /operator/config/cache.json clean --apply
 nds-cleaner-cache /operator/config/cache.json clean --apply --passes 32
 ```
+
+Select one profile per host from a verified `nds-cache-native-<os>-<arch>` CI
+artifact with `scripts/select-profile.py --artifact DIR --base-profile JSON`.
+It verifies `SHA256SUMS`, installs the execution (frontend) and maintenance
+(collector) binaries by source commit, writes one new profile with
+`retention_seconds` (default 86400) instead of editing a live one, generates the
+frontends, and renders the shell selector plus the scheduler (systemd user timer
+or launchd agent). `--collector` keeps collecting retained legacy roots and
+`--manager-path` replaces managed frontend prefixes in the systemd user manager
+`PATH`. It previews by default; `--apply` backs up every replaced file, writes a
+receipt for the estate record and runs a first collection preview, and
+`--rollback RECEIPT` restores the previous selection without deleting anything.
 
 `clean` defaults to preview. JSON reports distinguish stale/removed native units,
 native GC calls, active leases and completed-use observations. `empty_units`

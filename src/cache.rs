@@ -97,6 +97,12 @@ impl Config {
 pub enum CacheError {
     #[error("managed cache configuration is invalid")]
     Configuration,
+    /// The managed root owns the native cache location and its maintenance.
+    #[error(
+        "the managed cache location and its maintenance belong to NDS Cleaner; \
+         preview with `nds-cleaner-cache CONFIG clean` and apply with `clean --apply`"
+    )]
+    ManagedCacheCommand,
     #[error("cache is not owned, private or initialized")]
     Ownership,
     #[error("cache operation is busy; active work is preserved")]
@@ -1215,7 +1221,7 @@ impl ManagedCache {
             .take_while(|arg| arg.as_os_str() != "--")
             .any(|a| a == "cache" || a.to_str().is_some_and(|a| a.starts_with("--cache-dir")))
         {
-            return Err(CacheError::Configuration);
+            return Err(CacheError::ManagedCacheCommand);
         }
         let executable = executable.ok_or(CacheError::Provider)?;
         self.version(executable, &qualified(tool)?)?;
@@ -1913,6 +1919,40 @@ mod tests {
         )
         .unwrap();
         report
+    }
+    #[test]
+    fn native_cache_commands_name_the_cleaner_owner_and_change_nothing() {
+        let (_temp, config) = fixture();
+        let root = config.root.clone();
+        let cache = ManagedCache::initialize(config).unwrap();
+        let before: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        for (tool, args) in [
+            ("uv", vec!["cache", "prune"]),
+            ("uv", vec!["--cache-dir=/tmp/other", "sync"]),
+            ("bun", vec!["pm", "cache", "rm"]),
+        ] {
+            let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+            let error = cache
+                .run_tool(Path::new("/unused"), tool, &args)
+                .unwrap_err();
+            assert!(matches!(error, CacheError::ManagedCacheCommand));
+            assert!(error.to_string().contains("nds-cleaner-cache CONFIG clean"));
+        }
+        // Arguments after `--` belong to the called program, not to the frontend.
+        let passthrough: Vec<OsString> =
+            ["run", "--", "cache"].into_iter().map(Into::into).collect();
+        assert!(!matches!(
+            cache.run_tool(Path::new("/unused"), "uv", &passthrough),
+            Err(CacheError::ManagedCacheCommand)
+        ));
+        let after: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after);
     }
     #[test]
     fn retention_is_strict_and_clock_rollback_preserves() {
