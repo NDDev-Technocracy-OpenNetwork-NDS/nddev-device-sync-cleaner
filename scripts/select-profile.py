@@ -175,6 +175,39 @@ def render_selector(profile_path, profile_sha, execution, execution_sha, fronten
     return "\n".join(lines) + "\n"
 
 
+def manager_environment(paths, profile_text, roles, run):
+    """Bind only the selected profile's variables; never retain unrelated credentials."""
+    current = json.loads(run(["systemctl", "--user", "show-environment", "--output=json"]).stdout)
+    if not isinstance(current, dict) or not isinstance(current.get("PATH"), str):
+        raise ValueError("systemd user manager must expose a string PATH")
+    parts = [x for x in current["PATH"].split(":")
+             if not re.search(r"/\.local/share/nds/profiles/[^/]+/bin$", x)]
+    after = {
+        "PATH": ":".join([str(paths["frontends"]), *parts]),
+        "NDS_CLEANER_CONFIG": str(paths["profile"]),
+        "NDS_CLEANER_BIN": str(paths["binary"]["execution"]),
+        "NDS_CACHE_FRONTENDS": str(paths["frontends"]),
+        "NDS_CLEANER_BIN_SHA256": roles["execution"]["sha256"],
+        "NDS_CLEANER_CONFIG_SHA256": hashlib.sha256(profile_text.encode()).hexdigest(),
+    }
+    rustup_home = json.loads(profile_text).get("rustup_home")
+    if rustup_home:
+        after["RUSTUP_HOME"] = str(rustup_home)
+    before = {key: current.get(key) for key in after}
+    if any(value is not None and not isinstance(value, str) for value in before.values()):
+        raise ValueError("selected manager environment values must be strings")
+    return {"before": before, "after": after}
+
+
+def set_manager_environment(values, run):
+    present = [f"{key}={value}" for key, value in values.items() if value is not None]
+    absent = [key for key, value in values.items() if value is None]
+    if present:
+        run(["systemctl", "--user", "set-environment", *present])
+    if absent:
+        run(["systemctl", "--user", "unset-environment", *absent])
+
+
 def render_service(maintenance, configs):
     starts = "\n".join(f"ExecStart={shlex.join([str(maintenance), str(c), 'clean', '--apply', '--passes', '32'])}"
                        for c in configs)
@@ -256,15 +289,13 @@ def plan(args, run):
     else:
         raise ValueError("profile selection is qualified for Linux and macOS only")
     manager_path = None
+    environment = None
     if args.manager_path and system == "Linux":
-        current = run(["systemctl", "--user", "show-environment"]).stdout
-        line = next((l for l in current.splitlines() if l.startswith("PATH=")), None)
-        if line:
-            parts = [x for x in line[5:].split(":") if not re.search(r"/\.local/share/nds/profiles/[^/]+/bin$", x)]
-            manager_path = {"before": line[5:], "after": ":".join([str(p["frontends"]), *parts])}
+        environment = manager_environment(p, profile_text, roles, run)
+        manager_path = {key: value["PATH"] for key, value in environment.items()}
     return {"home": home, "artifact": artifact, "profile_id": profile_id, "paths": p, "profile_text": profile_text,
             "files": files, "collectors": collectors, "system": system, "manager_path": manager_path,
-            "base": base_path, "companions": shims}
+            "base": base_path, "companions": shims, "manager_environment": environment}
 
 
 def apply(selection, run):
@@ -307,8 +338,8 @@ def apply(selection, run):
             previous[key] = {"path": str(target), "backup": None, "sha256": None}
         atomic_write(target, content, 0o600 if key == "selector" else 0o644)
     reload(selection["system"], p, run)
-    if selection["manager_path"]:
-        run(["systemctl", "--user", "set-environment", "PATH=" + selection["manager_path"]["after"]])
+    if selection["manager_environment"]:
+        set_manager_environment(selection["manager_environment"]["after"], run)
     preview = run([str(p["binary"]["maintenance"]), str(p["profile"]), "clean"]).stdout
     receipt = {
         "schema": "nds-cleaner-selection/v1", "at": stamp, "host": platform.node(), "system": selection["system"],
@@ -319,6 +350,7 @@ def apply(selection, run):
                   for role, d in roles.items()},
         "frontends": str(p["frontends"]), "collectors": [str(c) for c in selection["collectors"]],
         "companions": carried, "replaced": previous, "manager_path": selection["manager_path"],
+        "manager_environment": selection["manager_environment"],
         "first_preview": json.loads(preview) if preview.strip().startswith("{") else preview.strip()[:2000],
     }
     atomic_write(state / "receipt.json", json.dumps(receipt, indent=1) + "\n", 0o600)
@@ -353,7 +385,9 @@ def rollback(receipt_path, run, write):
         reload(receipt["system"], paths(home, receipt["profile_id"], {})
                | {"plist": Path(receipt["replaced"].get("plist", {}).get("path", home / "Library/LaunchAgents" / f"{LABEL}.plist"))},
                run)
-        if receipt.get("manager_path"):
+        if receipt.get("manager_environment"):
+            set_manager_environment(receipt["manager_environment"]["before"], run)
+        elif receipt.get("manager_path"):  # Earlier receipts selected only PATH.
             run(["systemctl", "--user", "set-environment", "PATH=" + receipt["manager_path"]["before"]])
     return actions
 
@@ -371,7 +405,7 @@ def main(argv=None, run=runner):
     parser.add_argument("--companions-from", action="append", default=[],
                         help="another frontend directory whose host toolchain shims are carried over")
     parser.add_argument("--manager-path", action="store_true",
-                        help="replace managed frontend prefixes in the systemd user manager PATH (Linux)")
+                        help="select managed PATH and profile variables in the systemd user manager (Linux)")
     parser.add_argument("--home", default=str(Path.home()))
     parser.add_argument("--rollback")
     parser.add_argument("--apply", action="store_true")
@@ -387,7 +421,8 @@ def main(argv=None, run=runner):
                "roles": {r: d["source"] for r, d in selection["artifact"]["roles"].items()},
                "writes": sorted(selection["files"]), "collectors": [str(c) for c in selection["collectors"]],
                "companions": {n: str(s / n) for n, (s, _) in selection["companions"].items()},
-               "manager_path": selection["manager_path"], "applied": False}
+               "manager_path": selection["manager_path"],
+               "manager_environment": selection["manager_environment"], "applied": False}
     if not args.apply:
         print(json.dumps(summary, indent=1))
         return 0
