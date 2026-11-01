@@ -162,7 +162,14 @@ report fields are introduced in 0.0.1-alpha.3; existing single-pass calls remain
 supported.
 Cargo incremental, dependency and example payload directories are retained without
 traversal and counted as unknown; collection inspects recognized native unit
-groups instead. Provider, ownership and filesystem failures remain errors;
+groups instead. When every target of a lane has an expired completed use and none
+has a pending use, the lane's whole build directory is collected as one opaque unit
+under the lane's exclusive lease: Cargo's build-dir layout is an implementation
+detail (layout v2 becomes the default in Cargo 1.100) and Cargo itself collects only
+its global cache, never build artifacts. A lane without targets keeps its build
+directory. `removed_bytes` reports the allocated bytes of the units a pass removed
+itself, measured before unlinking with each hard-linked inode counted once; native
+provider GC reports its own effects. Provider, ownership and filesystem failures remain errors;
 progress is never substituted for a completed traversal. Scheduling and device paths belong to the operator's estate. This CLI
 adds no remote mutation command.
 Frozen release artifacts must be staged outside mutable caches.

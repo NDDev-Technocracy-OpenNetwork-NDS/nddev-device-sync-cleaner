@@ -1267,6 +1267,9 @@ pub struct Report {
     pub completed_uses: usize,
     pub scan_complete: bool,
     pub resumed: bool,
+    /// Allocated bytes of the units this pass removed itself, measured before unlinking; hard
+    /// links count once. Native provider GC (Cargo source, uv, Bun) reports its own effects.
+    pub removed_bytes: u64,
 }
 struct Budget {
     entries: usize,
@@ -1477,6 +1480,97 @@ fn stamp(dir: &Dir) -> Result<Option<SystemTime>> {
     }
     Ok(newest)
 }
+/// Allocated bytes under `dir`, without following symlinks; each multiply-linked inode counts once.
+fn tree_bytes(dir: &Dir) -> Result<u64> {
+    #[cfg(unix)]
+    use cap_std::fs::MetadataExt;
+    let mut seen = std::collections::HashSet::new();
+    let mut pending = vec![dir.try_clone()?];
+    let mut total = 0u64;
+    while let Some(current) = pending.pop() {
+        for entry in current.entries()? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            #[cfg(unix)]
+            let bytes = if metadata.nlink() > 1 && !seen.insert((metadata.dev(), metadata.ino())) {
+                0
+            } else {
+                metadata.blocks().saturating_mul(512)
+            };
+            #[cfg(not(unix))]
+            let bytes = {
+                let _ = &mut seen;
+                metadata.len()
+            };
+            total = total.saturating_add(bytes);
+            if metadata.is_dir() {
+                pending.push(directory(&current, Path::new(&entry.file_name()))?);
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Removes one collected unit and adds its measured bytes to the report.
+fn remove_unit(unit: Dir, report: &mut Report) -> Result<()> {
+    let bytes = tree_bytes(&unit)?;
+    unit.remove_open_dir_all()?;
+    report.removed_units += 1;
+    report.removed_bytes = report.removed_bytes.saturating_add(bytes);
+    Ok(())
+}
+
+/// Whether every target of a lane has been idle beyond `retention`: at least one qualified target,
+/// none with a pending use, each with an expired completed use. Read-only.
+fn lane_idle(lane: &Dir, current: u64, retention: Duration, budget: &mut Budget) -> Result<bool> {
+    let Ok(targets) = directory(lane, Path::new("targets")) else {
+        return Ok(false);
+    };
+    let mut any = false;
+    for entry in sorted_entries(&targets)? {
+        budget.visit()?;
+        let name = entry.file_name();
+        if !entry.file_type()?.is_dir() || !name.to_str().is_some_and(|s| hash_name(s, 64)) {
+            return Ok(false);
+        }
+        let target = directory(&targets, Path::new(&name))?;
+        match target.symlink_metadata(".pending-use") {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => return Ok(false),
+        }
+        match last_use(&target) {
+            Ok(last) if expired(last, current, retention) => any = true,
+            _ => return Ok(false),
+        }
+    }
+    Ok(any)
+}
+
+/// A lane's build directory. Cargo's build-dir layout is an implementation detail that changes
+/// (layout v2 in Cargo 1.100), and its native payloads are never traversed. When every target of
+/// the lane is idle beyond retention, the whole build directory is collected as one opaque unit
+/// under the lane's exclusive lease; otherwise only qualified fingerprint units are.
+fn lane_build(
+    lane: &Dir,
+    current: u64,
+    apply: bool,
+    report: &mut Report,
+    scan: &mut Scan,
+    prefix: &[String],
+) -> Result<()> {
+    let Ok(build) = directory(lane, Path::new("build")) else {
+        return Ok(());
+    };
+    if lane_idle(lane, current, scan.retention, &mut scan.budget)? {
+        report.stale_units += 1;
+        if apply {
+            scan.budget.effect(|| remove_unit(build, report))?;
+        }
+        return Ok(());
+    }
+    artifact_units(&build, 0, current, apply, report, scan, prefix)
+}
+
 fn artifact_units(
     dir: &Dir,
     depth: usize,
@@ -1546,8 +1640,7 @@ fn artifact_units(
                         if expired(seconds, current, scan.retention) {
                             report.stale_units += 1;
                             if apply {
-                                scan.budget.effect(|| Ok(unit_dir.remove_open_dir_all()?))?;
-                                report.removed_units += 1;
+                                scan.budget.effect(|| remove_unit(unit_dir, report))?;
                             }
                         }
                     } else {
@@ -1637,12 +1730,10 @@ impl ManagedCache {
             if scan.skip(&key) {
                 continue;
             }
-            if let Ok(build) = directory(&lane, Path::new("build")) {
-                let mut prefix = key.clone();
-                prefix.push("0".into());
-                if !scan.skip(&prefix) {
-                    artifact_units(&build, 0, current, apply, report, scan, &prefix)?;
-                }
+            let mut prefix = key.clone();
+            prefix.push("0".into());
+            if !scan.skip(&prefix) {
+                lane_build(&lane, current, apply, report, scan, &prefix)?;
             }
             if let Ok(targets) = directory(&lane, Path::new("targets")) {
                 let mut prefix = key.clone();
@@ -1674,8 +1765,7 @@ impl ManagedCache {
                         Ok(last) if expired(last, current, scan.retention) => {
                             report.stale_units += 1;
                             if apply {
-                                scan.budget.effect(|| Ok(target.remove_open_dir_all()?))?;
-                                report.removed_units += 1;
+                                scan.budget.effect(|| remove_unit(target, report))?;
                             }
                         }
                         Ok(_) => {}
@@ -2349,6 +2439,71 @@ mod tests {
                 assert_eq!(read_config(&path).unwrap().scan_entries, Some(limit));
             }
         }
+    }
+    #[test]
+    fn an_idle_lane_build_directory_is_collected_whole_and_measured() {
+        let temp = tempfile::tempdir().unwrap();
+        let lane = temp.path();
+        let current = now().unwrap();
+        let old = current - RETENTION.as_secs() - 10;
+        let payload = |lane: &Path| {
+            for name in ["incremental/crate-1/s-x", "deps", ".fingerprint/crate-1"] {
+                let dir = lane.join("build/debug").join(name);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join("object"), vec![7u8; 64 * 1024]).unwrap();
+            }
+        };
+        let target = |lane: &Path, name: char, last: u64| {
+            let dir = lane.join("targets").join(name.to_string().repeat(64));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(".last-use"), last.to_string()).unwrap();
+            dir
+        };
+        let run = |lane: &Path| {
+            let dir = Dir::open_ambient_dir(lane, ambient_authority()).unwrap();
+            let mut report = Report::default();
+            let mut scan = Scan::new(None);
+            scan.retention = RETENTION;
+            lane_build(&dir, current, true, &mut report, &mut scan, &[]).unwrap();
+            report
+        };
+        payload(lane);
+        target(lane, 'a', old);
+        target(lane, 'b', old);
+        let report = run(lane);
+        assert_eq!((report.stale_units, report.removed_units), (1, 1));
+        assert!(
+            report.removed_bytes >= 3 * 64 * 1024,
+            "{}",
+            report.removed_bytes
+        );
+        assert!(!lane.join("build").exists());
+        assert!(
+            lane.join("targets").exists(),
+            "targets are collected by their own rule"
+        );
+
+        // One recent target keeps the whole build directory; payloads stay untraversed.
+        payload(lane);
+        target(lane, 'c', current);
+        let report = run(lane);
+        assert_eq!((report.removed_units, report.removed_bytes), (0, 0));
+        assert!(
+            lane.join("build/debug/incremental/crate-1/s-x/object")
+                .exists()
+        );
+        assert!(report.unknown >= 2);
+
+        // A pending use keeps it too, whatever the recorded last use says.
+        fs::remove_dir_all(lane.join("targets")).unwrap();
+        let pending = target(lane, 'd', old);
+        fs::write(pending.join(".pending-use"), b"1").unwrap();
+        assert_eq!(run(lane).removed_units, 0);
+
+        // Without any target the lane's use is unknown, so nothing is collected.
+        fs::remove_dir_all(lane.join("targets")).unwrap();
+        assert_eq!(run(lane).removed_units, 0);
+        assert!(lane.join("build/debug/deps/object").exists());
     }
     #[test]
     fn native_payloads_do_not_starve_qualified_unit_collection() {
