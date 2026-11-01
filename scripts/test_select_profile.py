@@ -1,4 +1,5 @@
 """Profile selection: verified artifact, one new profile, selector, scheduler, receipt and rollback."""
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -176,6 +177,30 @@ class SelectProfile(unittest.TestCase):
         with mock.patch("sys.stdout"):
             self.fx.main("--rollback", str(receipt_path), "--apply")
         self.assertEqual(self.fx.environment["RUSTUP_HOME"], "/previous/rustup home")
+
+    def test_rollback_preserves_a_later_manager_selection_and_files(self):
+        with mock.patch("sys.stdout"):
+            self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base),
+                         "--manager-path", "--apply")
+        receipt_path = next((self.fx.home / ".local/state/nds/cleaner-selection").glob("*/receipt.json"))
+        before = self.fx.selector.read_text()
+        self.fx.environment["NDS_CLEANER_CONFIG"] = "/another/selected-profile.json"
+        with self.assertRaisesRegex(ValueError, "environment changed"):
+            self.fx.main("--rollback", str(receipt_path), "--apply")
+        self.assertEqual(self.fx.selector.read_text(), before)
+        self.assertEqual(self.fx.environment["NDS_CLEANER_CONFIG"], "/another/selected-profile.json")
+
+    def test_apply_refuses_a_changed_manager_snapshot_before_writing(self):
+        args = argparse.Namespace(home=str(self.fx.home), artifact=str(self.fx.artifact),
+                                  base_profile=str(self.fx.base), retention=86400, collector=[],
+                                  companions_from=[], manager_path=True)
+        selection = select.plan(args, self.fx.run)
+        self.fx.environment["PATH"] = "/another/bin:/usr/bin"
+        with self.assertRaisesRegex(ValueError, "environment changed"):
+            select.apply(selection, self.fx.run)
+        self.assertEqual(self.fx.selector.read_text(), "# legacy selector\n")
+        self.assertFalse(selection["paths"]["profile"].exists())
+        self.assertEqual(self.fx.environment["PATH"], "/another/bin:/usr/bin")
 
     def test_without_manager_selection_does_not_touch_environment(self):
         before = dict(self.fx.environment)

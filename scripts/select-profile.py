@@ -199,6 +199,12 @@ def manager_environment(paths, profile_text, roles, run):
     return {"before": before, "after": after}
 
 
+def require_manager_environment(expected, run):
+    current = json.loads(run(["systemctl", "--user", "show-environment", "--output=json"]).stdout)
+    if not isinstance(current, dict) or any(current.get(key) != value for key, value in expected.items()):
+        raise ValueError("selected manager environment changed; preserve it and prepare a fresh selection")
+
+
 def set_manager_environment(values, run):
     present = [f"{key}={value}" for key, value in values.items() if value is not None]
     absent = [key for key, value in values.items() if value is None]
@@ -299,6 +305,8 @@ def plan(args, run):
 
 
 def apply(selection, run):
+    if selection["manager_environment"]:
+        require_manager_environment(selection["manager_environment"]["before"], run)
     p, roles = selection["paths"], selection["artifact"]["roles"]
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     state = p["state"] / stamp
@@ -369,6 +377,8 @@ def reload(system, p, run):
 
 def rollback(receipt_path, run, write):
     receipt = json.loads(Path(receipt_path).read_text())
+    if write and receipt.get("manager_environment"):
+        require_manager_environment(receipt["manager_environment"]["after"], run)
     actions = []
     for key, entry in receipt["replaced"].items():
         target = Path(entry["path"])
