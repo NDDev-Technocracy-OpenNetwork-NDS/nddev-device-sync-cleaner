@@ -124,7 +124,9 @@ nds-cleaner-cache /operator/config/cache.json clean --apply --passes 32
 Select one profile per host from a verified `nds-cache-native-<os>-<arch>` CI
 artifact with `scripts/select-profile.py --artifact DIR --base-profile JSON`.
 It verifies `SHA256SUMS`, installs the execution (frontend) and maintenance
-(collector) binaries by source commit, writes one new profile with
+(collector) binaries by source commit (a rebuild of the same commit with other
+bytes goes beside it to `<source>-<sha256[:16]>`, never over a binary in use),
+writes one new profile with
 `retention_seconds` (default 86400) instead of editing a live one, generates the
 frontends, and renders the shell selector plus the scheduler (systemd user timer
 or launchd agent). `--collector` keeps collecting retained legacy roots and
