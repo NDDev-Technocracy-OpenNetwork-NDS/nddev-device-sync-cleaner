@@ -26,7 +26,9 @@ or configuration is refused.
 
 Without --apply nothing is written; the plan is printed. --apply backs up every
 replaced file under ~/.local/state/nds/cleaner-selection/<stamp>/ and writes a
-receipt that --rollback restores. Installed binaries and the new profile are
+receipt that --rollback restores. Binaries are installed by content: a rebuild of
+the same source with other bytes goes to cleaner/<source>-<sha256[:16]>/, so an
+existing selection is never replaced in place. Installed binaries and the new profile are
 left in place on rollback; nothing is deleted.
 """
 import argparse
@@ -48,7 +50,7 @@ UNIT = "nds-development-cache"
 HEX = re.compile(r"[0-9a-f]{40}")
 MARKER = "# NDS managed development cache frontend\n"
 MANAGED = re.compile(r"/\.local/share/nds/(cleaner|profiles)/|/\.config/nds/development-cache/")
-THROUGH_CLEANER = re.compile(r"(?m)^(exec )(\S+/\.local/share/nds/cleaner/[0-9a-f]{40}/nds-cleaner-cache) "
+THROUGH_CLEANER = re.compile(r"(?m)^(exec )(\S+/\.local/share/nds/cleaner/[0-9a-f]{40}(?:-[0-9a-f]{16})?/nds-cleaner-cache) "
                              r"(\S+/\.config/nds/development-cache/[^/\s]+\.json) ")
 
 
@@ -82,10 +84,23 @@ def verify_artifact(directory):
     return {"directory": directory, "roles": roles, "frontend_installer": directory / "install-cache-frontends.py"}
 
 
+def binary_path(share, source, digest):
+    """Where a role binary is installed. The per-source path the estate installer also uses is
+    taken when free or when it already holds exactly these bytes. CI rebuilds of one source commit
+    are not bit-identical (toolchain or runner image changes), so other bytes go to a
+    content-addressed sibling instead of replacing a binary an existing selection runs."""
+    legacy = share / "cleaner" / source / "nds-cleaner-cache"
+    if not legacy.exists() and not legacy.is_symlink():
+        return legacy
+    if legacy.is_file() and not legacy.is_symlink() and sha256(legacy) == digest:
+        return legacy
+    return share / "cleaner" / f"{source}-{digest[:16]}" / "nds-cleaner-cache"
+
+
 def paths(home, profile_id, roles):
     share = home / ".local/share/nds"
     return {
-        "binary": {role: share / "cleaner" / data["source"] / "nds-cleaner-cache" for role, data in roles.items()},
+        "binary": {role: binary_path(share, data["source"], data["sha256"]) for role, data in roles.items()},
         "profile": home / ".config/nds/development-cache" / f"{profile_id}.json",
         "frontends": share / "profiles" / profile_id / "bin",
         "selector": home / ".config/nds/development-profile.sh",
@@ -212,6 +227,10 @@ def plan(args, run):
     profile_text = json.dumps(profile, indent=1) + "\n"
     if p["profile"].exists() and p["profile"].read_text() != profile_text:
         raise ValueError("a different profile already uses this identity")
+    existing = p["frontends"] / "cargo"
+    if existing.is_file() and str(p["binary"]["execution"]) not in existing.read_text():
+        # Same sources rebuilt into other bytes must not rewrite a selected profile in place.
+        raise ValueError("a different execution binary already serves this profile identity")
     collectors = [Path(c).resolve(strict=True) for c in args.collector]
     for c in collectors:
         data = json.loads(c.read_text())

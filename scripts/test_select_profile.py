@@ -164,6 +164,28 @@ class SelectProfile(unittest.TestCase):
         self.assertIn("ulimit -n 8192", selector)
         self.assertNotIn("ulimit", select.render_selector("/p.json", "0" * 64, "/e", "1" * 64, "/f", None))
 
+    def test_a_rebuild_with_other_bytes_is_installed_beside_the_existing_binary(self):
+        legacy = self.fx.home / f".local/share/nds/cleaner/{EXECUTION}/nds-cleaner-cache"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text("#!/bin/sh\necho earlier build of the same source\n")
+        before = legacy.read_bytes()
+        with mock.patch("sys.stdout"):
+            self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base), "--apply")
+        digest = hashlib.sha256((self.fx.artifact / "execution/nds-cleaner-cache").read_bytes()).hexdigest()
+        installed = self.fx.home / f".local/share/nds/cleaner/{EXECUTION}-{digest[:16]}/nds-cleaner-cache"
+        self.assertEqual(installed.read_bytes(), (self.fx.artifact / "execution/nds-cleaner-cache").read_bytes())
+        self.assertEqual(legacy.read_bytes(), before)
+        profile_id = f"{EXECUTION[:12]}-{MAINTENANCE[:12]}-r86400"
+        wrapper = (self.fx.home / f".local/share/nds/profiles/{profile_id}/bin/cargo").read_text()
+        self.assertIn(str(installed), wrapper)
+        receipt = json.loads(next((self.fx.home / ".local/state/nds/cleaner-selection").glob("*/receipt.json")).read_text())
+        self.assertEqual(receipt["roles"]["execution"]["path"], str(installed))
+        # The selected identity is not rewritten for yet another build of the same sources.
+        (self.fx.artifact / "execution/nds-cleaner-cache").write_text("#!/bin/sh\necho third build\n")
+        self.fx.write_sums()
+        with self.assertRaisesRegex(ValueError, "different execution binary already serves"):
+            self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base))
+
     def test_retention_must_be_whole_days(self):
         with self.assertRaisesRegex(ValueError, "whole days"):
             self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base),
