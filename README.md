@@ -134,8 +134,9 @@ or launchd agent). `--collector` keeps collecting retained legacy roots and
 binary, hashes and configured Rustup home in the Linux systemd user manager. New
 services therefore inherit the same selection as new shells; existing processes
 keep their captured environment. The receipt records only these owned variables,
-and rollback restores prior values or removes previously absent ones. It does
-not copy credentials or unrelated manager variables. Host toolchain shims that the estate installer placed beside the managed
+and rollback restores prior values or removes previously absent ones. Selection
+and rollback refuse before writing if those owned manager values changed since
+their captured state. They do not copy credentials or unrelated manager variables. Host toolchain shims that the estate installer placed beside the managed
 frontends (interpreters, compilers, TypeScript) are carried from the base
 profile and every `--companions-from` directory into the new frontends, a shim
 that runs through the Cleaner is retargeted to the new binary and profile, and
