@@ -1,4 +1,5 @@
 """Profile selection: verified artifact, one new profile, selector, scheduler, receipt and rollback."""
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -52,6 +53,13 @@ class Fixture:
         (legacy / "tsc").write_text(f'#!/bin/sh\nexec {legacy_cleaner} {self.base} bun /opt/typescript/bin/tsc "$@"\n')
         self.legacy = legacy
         self.calls = []
+        self.environment = {
+            "PATH": "/x/.local/share/nds/profiles/legacy/bin:/opt/tool chain/bin:/usr/bin",
+            "NDS_CLEANER_CONFIG": "legacy profile with spaces.json",
+            "NDS_CLEANER_BIN": "/legacy/cleaner",
+            "NDS_CACHE_FRONTENDS": "/legacy/frontends",
+            "UNRELATED_SECRET": "must-not-enter-a-receipt",
+        }
 
     def write_sums(self):
         lines = []
@@ -63,7 +71,12 @@ class Fixture:
     def run(self, command, check=True):
         self.calls.append(command)
         if command[0] in {"systemctl", "launchctl"}:
-            stdout = "PATH=/x/.local/share/nds/profiles/legacy/bin:/usr/bin\n" if "show-environment" in command else ""
+            stdout = json.dumps(self.environment) if "show-environment" in command else ""
+            if "set-environment" in command:
+                self.environment.update(item.split("=", 1) for item in command[3:])
+            elif "unset-environment" in command:
+                for name in command[3:]:
+                    self.environment.pop(name, None)
             return subprocess.CompletedProcess(command, 0, stdout, "")
         return subprocess.run(command, check=check, capture_output=True, text=True, timeout=60)
 
@@ -129,6 +142,91 @@ class SelectProfile(unittest.TestCase):
         self.assertTrue(profile.exists())  # rollback never deletes the installed profile
         self.assertTrue(any(c[:3] == ["systemctl", "--user", "set-environment"] and "legacy" in c[3]
                             for c in self.fx.calls))
+
+    def test_manager_selection_matches_shell_and_rollback_preserves_absence(self):
+        before = dict(self.fx.environment)
+        with mock.patch("sys.stdout"):
+            self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base),
+                         "--manager-path", "--apply")
+        receipt_path = next((self.fx.home / ".local/state/nds/cleaner-selection").glob("*/receipt.json"))
+        receipt = json.loads(receipt_path.read_text())
+        environment = receipt["manager_environment"]
+        self.assertNotIn("UNRELATED_SECRET", environment["before"])
+        self.assertNotIn("must-not-enter-a-receipt", receipt_path.read_text())
+        self.assertIsNone(environment["before"]["NDS_CLEANER_CONFIG_SHA256"])
+        shell = subprocess.run(["sh", "-c", '. "$1"; env', "sh", str(self.fx.selector)],
+                               env={"PATH": before["PATH"]}, capture_output=True, text=True, check=True)
+        shell_values = dict(line.split("=", 1) for line in shell.stdout.splitlines() if "=" in line)
+        for key in environment["after"]:
+            self.assertEqual(self.fx.environment[key], shell_values[key])
+        self.assertEqual(self.fx.environment["UNRELATED_SECRET"], before["UNRELATED_SECRET"])
+        with mock.patch("sys.stdout"):
+            self.fx.main("--rollback", str(receipt_path), "--apply")
+        self.assertEqual(self.fx.environment, before)
+
+    def test_selected_rustup_home_is_restored_after_rollback(self):
+        base = json.loads(self.fx.base.read_text())
+        base["rustup_home"] = "/selected/rustup home"
+        self.fx.base.write_text(json.dumps(base))
+        self.fx.environment["RUSTUP_HOME"] = "/previous/rustup home"
+        with mock.patch("sys.stdout"):
+            self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base),
+                         "--manager-path", "--apply")
+        self.assertEqual(self.fx.environment["RUSTUP_HOME"], base["rustup_home"])
+        receipt_path = next((self.fx.home / ".local/state/nds/cleaner-selection").glob("*/receipt.json"))
+        with mock.patch("sys.stdout"):
+            self.fx.main("--rollback", str(receipt_path), "--apply")
+        self.assertEqual(self.fx.environment["RUSTUP_HOME"], "/previous/rustup home")
+
+    def test_rollback_preserves_a_later_manager_selection_and_files(self):
+        with mock.patch("sys.stdout"):
+            self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base),
+                         "--manager-path", "--apply")
+        receipt_path = next((self.fx.home / ".local/state/nds/cleaner-selection").glob("*/receipt.json"))
+        before = self.fx.selector.read_text()
+        self.fx.environment["NDS_CLEANER_CONFIG"] = "/another/selected-profile.json"
+        with self.assertRaisesRegex(ValueError, "environment changed"):
+            self.fx.main("--rollback", str(receipt_path), "--apply")
+        self.assertEqual(self.fx.selector.read_text(), before)
+        self.assertEqual(self.fx.environment["NDS_CLEANER_CONFIG"], "/another/selected-profile.json")
+
+    def test_apply_refuses_a_changed_manager_snapshot_before_writing(self):
+        args = argparse.Namespace(home=str(self.fx.home), artifact=str(self.fx.artifact),
+                                  base_profile=str(self.fx.base), retention=86400, collector=[],
+                                  companions_from=[], manager_path=True)
+        selection = select.plan(args, self.fx.run)
+        self.fx.environment["PATH"] = "/another/bin:/usr/bin"
+        with self.assertRaisesRegex(ValueError, "environment changed"):
+            select.apply(selection, self.fx.run)
+        self.assertEqual(self.fx.selector.read_text(), "# legacy selector\n")
+        self.assertFalse(selection["paths"]["profile"].exists())
+        self.assertEqual(self.fx.environment["PATH"], "/another/bin:/usr/bin")
+
+    def test_without_manager_selection_does_not_touch_environment(self):
+        before = dict(self.fx.environment)
+        with mock.patch("sys.stdout"):
+            self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base), "--apply")
+        self.assertEqual(self.fx.environment, before)
+        self.assertFalse(any("set-environment" in c or "unset-environment" in c for c in self.fx.calls))
+
+    def test_missing_manager_path_refuses_before_writes(self):
+        self.fx.environment.pop("PATH")
+        with self.assertRaisesRegex(ValueError, "string PATH"):
+            self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base),
+                         "--manager-path", "--apply")
+        self.assertEqual(self.fx.selector.read_text(), "# legacy selector\n")
+
+    def test_legacy_receipt_still_restores_path(self):
+        with mock.patch("sys.stdout"):
+            self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base), "--apply")
+        receipt_path = next((self.fx.home / ".local/state/nds/cleaner-selection").glob("*/receipt.json"))
+        receipt = json.loads(receipt_path.read_text())
+        receipt.pop("manager_environment")
+        receipt["manager_path"] = {"before": "/legacy/bin:/usr/bin", "after": "/selected/bin:/usr/bin"}
+        receipt_path.write_text(json.dumps(receipt))
+        with mock.patch("sys.stdout"):
+            self.fx.main("--rollback", str(receipt_path), "--apply")
+        self.assertEqual(self.fx.environment["PATH"], "/legacy/bin:/usr/bin")
 
     def test_collector_must_differ_by_root_or_cargo_home(self):
         same = self.fx.home / "same.json"

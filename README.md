@@ -130,8 +130,13 @@ writes one new profile with
 `retention_seconds` (default 86400) instead of editing a live one, generates the
 frontends, and renders the shell selector plus the scheduler (systemd user timer
 or launchd agent). `--collector` keeps collecting retained legacy roots and
-`--manager-path` replaces managed frontend prefixes in the systemd user manager
-`PATH`. Host toolchain shims that the estate installer placed beside the managed
+`--manager-path` selects the managed frontend prefix and matching profile, execution
+binary, hashes and configured Rustup home in the Linux systemd user manager. New
+services therefore inherit the same selection as new shells; existing processes
+keep their captured environment. The receipt records only these owned variables,
+and rollback restores prior values or removes previously absent ones. Selection
+and rollback refuse before writing if those owned manager values changed since
+their captured state. They do not copy credentials or unrelated manager variables. Host toolchain shims that the estate installer placed beside the managed
 frontends (interpreters, compilers, TypeScript) are carried from the base
 profile and every `--companions-from` directory into the new frontends, a shim
 that runs through the Cleaner is retargeted to the new binary and profile, and
