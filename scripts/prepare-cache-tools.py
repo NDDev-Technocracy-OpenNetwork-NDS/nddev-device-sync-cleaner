@@ -7,17 +7,52 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import stat
 import tarfile
 import tempfile
 import urllib.request
+import urllib.parse
 import zipfile
 
 LOCK = Path(__file__).resolve().parents[1] / "cache-providers.lock.json"
 LIMIT = 256 * 1024 * 1024
 
 
-def prepare(destination):
+
+def central_base(value):
+    if value is None:
+        return None
+    parsed = urllib.parse.urlsplit(value)
+    if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1"
+            or parsed.username is not None or parsed.password is not None
+            or parsed.port is None or not 1 <= parsed.port <= 65535
+            or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+        raise ValueError("cache base must be a literal HTTP IPv4 loopback listener with a port")
+    return value.rstrip("/")
+
+
+def download_url(url, digest, base):
+    if base is None:
+        return url
+    parsed = urllib.parse.urlsplit(url)
+    if (parsed.scheme != "https" or parsed.username is not None or parsed.password is not None
+            or parsed.port is not None or parsed.query or parsed.fragment):
+        raise ValueError("tool source is not an admitted public artifact URL")
+    if parsed.netloc == "static.rust-lang.org":
+        return base + "/rustup" + parsed.path
+    if parsed.netloc == "github.com" and re.fullmatch(r"/[^/]+/[^/]+/releases/download/[^/]+/[^/]+", parsed.path):
+        return base + "/github-releases/sha256/" + digest + parsed.path
+    raise ValueError("tool source has no admitted central cache route")
+
+
+class CentralNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def prepare(destination, cache_base=None):
+    cache_base = central_base(cache_base)
     lock_bytes = LOCK.read_bytes()
     lock = json.loads(lock_bytes)
     system = {"Linux": "linux", "Darwin": "darwin"}.get(platform.system())
@@ -50,8 +85,11 @@ def prepare(destination):
         stage = Path(work) / "prepared"
         (stage / "bin").mkdir(parents=True)
         binaries = {}
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), CentralNoRedirect()) if cache_base else None
         for artifact in selected.values():
-            with urllib.request.urlopen(artifact["url"], timeout=60) as response:
+            url = download_url(artifact["url"], artifact["sha256"], cache_base)
+            open_url = opener.open if opener else urllib.request.urlopen
+            with open_url(url, timeout=60) as response:
                 archive = response.read(LIMIT + 1)
             if len(archive) > LIMIT or hashlib.sha256(archive).hexdigest() != artifact["sha256"]:
                 raise ValueError("archive digest or size differs from lock")
@@ -92,5 +130,6 @@ def prepare(destination):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("destination", type=Path)
+    parser.add_argument("--cache-base", help="selected literal loopback network cache; failure never falls back upstream")
     arguments = parser.parse_args()
-    print(json.dumps(prepare(arguments.destination)))
+    print(json.dumps(prepare(arguments.destination, arguments.cache_base)))
