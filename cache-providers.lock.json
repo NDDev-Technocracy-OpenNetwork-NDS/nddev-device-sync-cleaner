@@ -6,7 +6,7 @@
   },
   "versions": {
     "cargo": "cargo 1.101.0-nightly (15be64aa0 2026-10-20)",
-    "uv": "uv 0.13.5",
+    "uv": "uv 0.13.6",
     "bun": "1.4.4"
   },
   "platforms": {
@@ -22,16 +22,16 @@
         }
       },
       "uv": {
-        "url": "https://github.com/astral-sh/uv/releases/download/0.13.5/uv-x86_64-unknown-linux-gnu.tar.gz",
-        "sha256": "f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f",
+        "url": "https://github.com/astral-sh/uv/releases/download/0.13.6/uv-x86_64-unknown-linux-gnu.tar.gz",
+        "sha256": "f29c3e94ffabd7e6f3ba521dba169a9b7ec12100bf3257087f0f24f6123f3645",
         "members": {
           "uv": "uv-x86_64-unknown-linux-gnu/uv",
           "uvx": "uv-x86_64-unknown-linux-gnu/uvx"
         },
-        "version_report": "uv 0.13.5 (x86_64-unknown-linux-gnu)",
+        "version_report": "uv 0.13.6 (x86_64-unknown-linux-gnu)",
         "binary_sha256": {
-          "uv": "8a70db72685b7138121bfcda71fa1a00cb709ed9f1fdc4ecf1dd871e8e167e52",
-          "uvx": "a54e15e5ff32ac5432fdd7a9819e2b2a326651f0589d6b58b8b98c3cc28d3592"
+          "uv": "23803452c0fbe125033054cd9ff245f1d649fb65b4b73f68429f4abda432436d",
+          "uvx": "2f286670c2c09915c57555ddd95931ae0ab3feeaa09dfc73e21de9e8789306d5"
         }
       },
       "bun": {
@@ -57,16 +57,16 @@
         }
       },
       "uv": {
-        "url": "https://github.com/astral-sh/uv/releases/download/0.13.5/uv-aarch64-apple-darwin.tar.gz",
-        "sha256": "743f85035a1996ecb350659e01cd9faea9709829be09b1b4b03c73eaf3c9cd73",
+        "url": "https://github.com/astral-sh/uv/releases/download/0.13.6/uv-aarch64-apple-darwin.tar.gz",
+        "sha256": "60fbd5c8a1ed681845eea28d9d622fcde03c51e91a43465b64a1e17db1ed3472",
         "members": {
           "uv": "uv-aarch64-apple-darwin/uv",
           "uvx": "uv-aarch64-apple-darwin/uvx"
         },
-        "version_report": "uv 0.13.5 (46776a95d 2026-10-21 aarch64-apple-darwin)",
+        "version_report": "uv 0.13.6 (329bf9448 2026-10-26 aarch64-apple-darwin)",
         "binary_sha256": {
-          "uv": "7dad6047467a9d6b081c033cb3efed9ba39a4799c698d09e6cd598f3a6a32338",
-          "uvx": "e34502e6f7204735483527b722dbff2a505fc28a19d8026d2eb3d179fa4a8ad9"
+          "uv": "3996850e6d85e60b0142b40af4bd984822d65f736b52209921c47312450685cb",
+          "uvx": "06b280b49980a1494c07702cad44156789cb8a1bab75004be16c4c20bc248ad1"
         }
       },
       "bun": {

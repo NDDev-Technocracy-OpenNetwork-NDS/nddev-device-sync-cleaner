@@ -68,6 +68,9 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Native transport tests
         run: cargo test --locked --workspace
+      - name: Profile selector tests
+        if: runner.os == 'Linux'
+        run: python3 -B -m unittest discover -s scripts -p 'test_select_profile.py'
       - name: Install verified prebuilt Rust quality tools
         if: runner.os == 'Linux'
         uses: NDDev-Technocracy-Standarts/std-0004-ci-cd-workflows/.github/actions/tools@c192c6adcf22088abf456635de614d42e8fa3f8d # nddev-cicd-v0.6.20
@@ -92,7 +95,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          execution_source=3f75f6a10842271af206132e74a88159ccfbdf00
+          execution_source=0f119642c0facf8c41610c0168ab7ded6716d061
           execution="$RUNNER_TEMP/nds-cache-execution-source"
           git fetch --no-tags origin "$execution_source"
           git worktree add --detach "$execution" "$execution_source"
