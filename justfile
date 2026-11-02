@@ -4,7 +4,7 @@ check:
     cargo fmt -- --check
     cargo clippy --locked --all-targets -- -D warnings
     cargo test --locked
-    python3 -B -m unittest discover -s scripts -p 'test_select_profile.py'
+    python3 -B -m unittest discover -s scripts -p 'test_*.py'
 
 # Preview by default; add --apply to select, --rollback RECEIPT to restore.
 select-profile artifact base *args:
