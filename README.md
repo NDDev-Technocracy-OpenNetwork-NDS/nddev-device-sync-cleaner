@@ -214,3 +214,5 @@ These are finite CI artifacts, not an installed selection or host acceptance.
 Consumers preserve verified bytes under their existing artifact pin before
 expiry and qualify their own configuration, policy, jobs and rollback. Windows
 module tests do not qualify managed-cache deployment on Windows.
+
+Tool preparation accepts an explicit `--cache-base http://127.0.0.1:PORT` listener. It maps pinned public Rust distributions and GitHub release assets onto the existing central routes, retaining archive and executable digest checks. The selected connection ignores proxy variables and refuses redirects or central failures without an upstream retry. Omitting the option preserves public contributor downloads.
