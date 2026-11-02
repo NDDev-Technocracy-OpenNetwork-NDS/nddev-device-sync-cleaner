@@ -3,7 +3,8 @@
 
 usage:
   select-profile.py --artifact DIR --base-profile JSON [--retention SECONDS]
-                    [--collector JSON ...] [--companions-from DIR ...] [--manager-path] [--apply]
+                    [--collector JSON ...] [--companions-from DIR ...] [--profile-revision SHA256]
+                    [--manager-path] [--apply]
   select-profile.py --rollback RECEIPT [--apply]
 
 The artifact is the extracted `nds-cache-native-<os>-<arch>` CI output: its
@@ -23,6 +24,11 @@ carried into the new frontend directory so selecting a profile never drops a
 command from PATH. A shim that runs through the Cleaner is retargeted to the new
 execution binary and profile; any other reference to a managed profile, binary
 or configuration is refused.
+
+An optional --profile-revision SHA256 adds the input digest to the profile identity, so a
+new SDK or companion selection can be installed beside the previous profile without changing
+the Cleaner binaries. The estate supplies that non-secret input identity; existing profile and
+companion byte-conflict checks still apply. Omitting it retains the original naming scheme.
 
 Without --apply nothing is written; the plan is printed. --apply backs up every
 replaced file under ~/.local/state/nds/cleaner-selection/<stamp>/ and writes a
@@ -261,6 +267,11 @@ def plan(args, run):
     if not 86400 <= args.retention <= 31536000 or args.retention % 86400:
         raise ValueError("retention must be whole days from 86400 through 31536000 seconds")
     profile_id = f"{roles['execution']['source'][:12]}-{roles['maintenance']['source'][:12]}-r{args.retention}"
+    revision = getattr(args, "profile_revision", None)
+    if revision is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", revision):
+            raise ValueError("profile revision must be a complete lowercase SHA-256")
+        profile_id += "-" + revision[:12]
     p = paths(home, profile_id, roles)
     profile = dict(base, retention_seconds=args.retention, frontends=str(p["frontends"]))
     profile_text = json.dumps(profile, indent=1) + "\n"
@@ -411,6 +422,8 @@ def main(argv=None, run=runner):
     parser.add_argument("--artifact")
     parser.add_argument("--base-profile")
     parser.add_argument("--retention", type=int, default=86400)
+    parser.add_argument("--profile-revision",
+                        help="SHA-256 of the estate-selected tool/profile inputs; gives SDK updates a new immutable identity")
     parser.add_argument("--collector", action="append", default=[])
     parser.add_argument("--companions-from", action="append", default=[],
                         help="another frontend directory whose host toolchain shims are carried over")
