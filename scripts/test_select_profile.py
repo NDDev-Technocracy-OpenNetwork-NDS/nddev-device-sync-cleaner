@@ -90,6 +90,38 @@ class SelectProfile(unittest.TestCase):
         self.fx = Fixture()
         self.addCleanup(self.fx.temp.cleanup)
 
+    def test_new_tool_revision_preserves_the_previously_selected_profile(self):
+        with mock.patch("sys.stdout"):
+            self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base), "--apply")
+        old_profile = next((self.fx.home / ".config/nds/development-cache").glob("*-r86400.json"))
+        old_bytes = old_profile.read_bytes()
+        old_wrappers = {p.name: p.read_bytes() for p in Path(json.loads(old_bytes)["frontends"]).iterdir()}
+        base = json.loads(self.fx.base.read_text())
+        base["cargo"] = "/bin/true"
+        self.fx.base.write_text(json.dumps(base))
+        with self.assertRaisesRegex(ValueError, "different profile"):
+            with mock.patch("sys.stdout"):
+                self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base))
+        import io
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base),
+                         "--profile-revision", "b" * 64)
+        plan = json.loads(output.getvalue())
+        self.assertTrue(plan["profile_id"].endswith("-r86400-" + "b" * 12))
+        self.assertNotEqual(Path(plan["profile"]), old_profile)
+        self.assertFalse(Path(plan["profile"]).exists())
+        self.assertEqual(old_profile.read_bytes(), old_bytes)
+        self.assertEqual({p.name: p.read_bytes() for p in Path(json.loads(old_bytes)["frontends"]).iterdir()}, old_wrappers)
+
+    def test_invalid_profile_revision_cannot_escape_the_owned_path(self):
+        for revision in ("../foreign", "A" * 64, "b" * 63):
+            with self.assertRaisesRegex(ValueError, "complete lowercase SHA-256"):
+                with mock.patch("sys.stdout"):
+                    self.fx.main("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base),
+                                 "--profile-revision", revision)
+        self.assertEqual(self.fx.selector.read_text(), "# legacy selector\n")
+
     def test_preview_writes_nothing(self):
         before = sorted(p.relative_to(self.fx.home) for p in self.fx.home.rglob("*"))
         with mock.patch("sys.stdout"):
