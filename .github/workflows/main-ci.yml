@@ -18,7 +18,7 @@ env:
 
 jobs:
   contract:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -33,14 +33,14 @@ jobs:
           add-job-id-key: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install pinned quality tools
-        uses: NDDev-Technocracy-Standarts/std-0004-ci-cd-workflows/.github/actions/tools@365415f32190ae22ff22462e791a4829ad6e91fc # nddev-cicd-v0.6.16
+        uses: NDDev-Technocracy-Standarts/std-0004-ci-cd-workflows/.github/actions/tools@c192c6adcf22088abf456635de614d42e8fa3f8d # nddev-cicd-v0.6.20
         with:
           # cargo-audit 0.22.2, cargo-deny 0.20.2 and cargo-nextest 0.9.149 from checksummed
           # releases instead of compiling them with cargo install in every job.
           capability: rust
       - name: Run the STD-0004 native Rust contract
         id: native
-        uses: NDDev-Technocracy-Standarts/std-0004-ci-cd-workflows/.github/actions/ci@a77e385fcf3c1b000c38167ecac7b74bb7715b10 # std-0004-v0.3.1
+        uses: NDDev-Technocracy-Standarts/std-0004-ci-cd-workflows/.github/actions/ci@c192c6adcf22088abf456635de614d42e8fa3f8d # nddev-cicd-v0.6.20
       - name: Require complete native results
         if: ${{ !cancelled() }}
         env:
@@ -53,7 +53,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15, windows-2022]
+        os: [ubuntu-26.04, macos-15, windows-2022]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -68,9 +68,12 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Native transport tests
         run: cargo test --locked --workspace
+      - name: Profile selector tests
+        if: runner.os == 'Linux'
+        run: python3 -B -m unittest discover -s scripts -p 'test_select_profile.py'
       - name: Install verified prebuilt Rust quality tools
         if: runner.os == 'Linux'
-        uses: NDDev-Technocracy-Standarts/std-0004-ci-cd-workflows/.github/actions/tools@365415f32190ae22ff22462e791a4829ad6e91fc # nddev-cicd-v0.6.16
+        uses: NDDev-Technocracy-Standarts/std-0004-ci-cd-workflows/.github/actions/tools@c192c6adcf22088abf456635de614d42e8fa3f8d # nddev-cicd-v0.6.20
         with:
           # cargo-audit 0.22.2, cargo-deny 0.20.2 and cargo-nextest 0.9.149 from checksummed
           # releases instead of compiling them with cargo install in every job.
@@ -92,7 +95,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          execution_source=3f75f6a10842271af206132e74a88159ccfbdf00
+          execution_source=0f119642c0facf8c41610c0168ab7ded6716d061
           execution="$RUNNER_TEMP/nds-cache-execution-source"
           git fetch --no-tags origin "$execution_source"
           git worktree add --detach "$execution" "$execution_source"

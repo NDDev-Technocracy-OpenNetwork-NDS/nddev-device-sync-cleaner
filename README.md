@@ -124,12 +124,25 @@ nds-cleaner-cache /operator/config/cache.json clean --apply --passes 32
 Select one profile per host from a verified `nds-cache-native-<os>-<arch>` CI
 artifact with `scripts/select-profile.py --artifact DIR --base-profile JSON`.
 It verifies `SHA256SUMS`, installs the execution (frontend) and maintenance
-(collector) binaries by source commit, writes one new profile with
+(collector) binaries by source commit (a rebuild of the same commit with other
+bytes goes beside it to `<source>-<sha256[:16]>`, never over a binary in use),
+writes one new profile with
 `retention_seconds` (default 86400) instead of editing a live one, generates the
 frontends, and renders the shell selector plus the scheduler (systemd user timer
 or launchd agent). `--collector` keeps collecting retained legacy roots and
-`--manager-path` replaces managed frontend prefixes in the systemd user manager
-`PATH`. It previews by default; `--apply` backs up every replaced file, writes a
+`--manager-path` selects the managed frontend prefix and matching profile, execution
+binary, hashes and configured Rustup home in the Linux systemd user manager. New
+services therefore inherit the same selection as new shells; existing processes
+keep their captured environment. The receipt records only these owned variables,
+and rollback restores prior values or removes previously absent ones. Selection
+and rollback refuse before writing if those owned manager values changed since
+their captured state. They do not copy credentials or unrelated manager variables. Host toolchain shims that the estate installer placed beside the managed
+frontends (interpreters, compilers, TypeScript) are carried from the base
+profile and every `--companions-from` directory into the new frontends, a shim
+that runs through the Cleaner is retargeted to the new binary and profile, and
+any other managed reference is refused, so a selection never drops a command
+from `PATH`. On macOS the selector raises the descriptor soft limit to 8192 for
+native Cargo locks. It previews by default; `--apply` backs up every replaced file, writes a
 receipt for the estate record and runs a first collection preview, and
 `--rollback RECEIPT` restores the previous selection without deleting anything.
 
@@ -156,7 +169,14 @@ report fields are introduced in 0.0.1-alpha.3; existing single-pass calls remain
 supported.
 Cargo incremental, dependency and example payload directories are retained without
 traversal and counted as unknown; collection inspects recognized native unit
-groups instead. Provider, ownership and filesystem failures remain errors;
+groups instead. When every target of a lane has an expired completed use and none
+has a pending use, the lane's whole build directory is collected as one opaque unit
+under the lane's exclusive lease: Cargo's build-dir layout is an implementation
+detail (layout v2 becomes the default in Cargo 1.100) and Cargo itself collects only
+its global cache, never build artifacts. A lane without targets keeps its build
+directory. `removed_bytes` reports the allocated bytes of the units a pass removed
+itself, measured before unlinking with each hard-linked inode counted once; native
+provider GC reports its own effects. Provider, ownership and filesystem failures remain errors;
 progress is never substituted for a completed traversal. Scheduling and device paths belong to the operator's estate. This CLI
 adds no remote mutation command.
 Frozen release artifacts must be staged outside mutable caches.
@@ -194,3 +214,5 @@ These are finite CI artifacts, not an installed selection or host acceptance.
 Consumers preserve verified bytes under their existing artifact pin before
 expiry and qualify their own configuration, policy, jobs and rollback. Windows
 module tests do not qualify managed-cache deployment on Windows.
+
+Tool preparation accepts an explicit `--cache-base http://127.0.0.1:PORT` listener. It maps pinned public Rust distributions and GitHub release assets onto the existing central routes, retaining archive and executable digest checks. The selected connection ignores proxy variables and refuses redirects or central failures without an upstream retry. Omitting the option preserves public contributor downloads.
