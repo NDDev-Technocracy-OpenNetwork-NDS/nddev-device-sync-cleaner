@@ -1942,8 +1942,12 @@ impl ManagedCache {
             Ok(_) => {}
             Err(CacheError::Native {
                 reason: "timeout", ..
-            }) if !native_locks_available(&home, locks)? => {
-                report.busy += 1;
+            }) => {
+                if !native_locks_available(&home, locks)? {
+                    report.busy += 1;
+                }
+                // The bounded child has exited. Leave Cargo to retry source
+                // GC on a later pass and let other selected roots proceed.
                 report.source_gc_deferred = true;
                 return Ok(());
             }
