@@ -122,6 +122,22 @@ class SelectProfile(unittest.TestCase):
                                  "--profile-revision", revision)
         self.assertEqual(self.fx.selector.read_text(), "# legacy selector\n")
 
+    def test_workspace_lanes_require_support_from_both_roles_before_apply(self):
+        base = json.loads(self.fx.base.read_text())
+        self.fx.base.write_text(json.dumps(dict(base, cargo_workspace_lanes=True)))
+        args = ("--artifact", str(self.fx.artifact), "--base-profile", str(self.fx.base))
+        for role in ("execution", "maintenance"):
+            with self.assertRaisesRegex(ValueError, f"{role} binary does not support"):
+                self.fx.main(*args, "--apply")
+            self.assertEqual(self.fx.selector.read_text(), "# legacy selector\n")
+            self.assertFalse(any(self.fx.home.rglob("*-r86400.json")))
+            binary = self.fx.artifact / role / "nds-cleaner-cache"
+            binary.write_text("#!/bin/sh\necho cargo_workspace_lanes\n")
+            self.fx.write_sums()
+        with mock.patch("sys.stdout"):
+            self.fx.main(*args)
+        self.assertFalse(any(self.fx.home.rglob("*-r86400.json")))
+
     def test_preview_writes_nothing(self):
         before = sorted(p.relative_to(self.fx.home) for p in self.fx.home.rglob("*"))
         with mock.patch("sys.stdout"):
