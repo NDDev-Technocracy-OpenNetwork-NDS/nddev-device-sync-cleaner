@@ -174,11 +174,24 @@ has a pending use, the lane's whole build directory is collected as one opaque u
 under the lane's exclusive lease: Cargo's build-dir layout is an implementation
 detail (layout v2 becomes the default in Cargo 1.100) and Cargo itself collects only
 its global cache, never build artifacts. A lane without targets keeps its build
-directory. `removed_bytes` reports the allocated bytes of the units a pass removed
-itself, measured before unlinking with each hard-linked inode counted once; native
-provider GC reports its own effects. Provider, ownership and filesystem failures remain errors;
-progress is never substituted for a completed traversal. Scheduling and device paths belong to the operator's estate. This CLI
-adds no remote mutation command.
+directory. A profile can set `cargo_workspace_lanes: true` to put each workspace's
+default Cargo outputs under its own lane lease. An active workspace can then
+retain its outputs while Cleaner collects other idle workspaces. The default
+preserves existing paths. Enabling the setting selects new output directories
+and requires a cold build per workspace. Existing outputs keep their leases and
+retention. Explicit managed paths retain their own lane lease and opaque Cargo
+`--config` invocations keep the compiler-scoped default. Profile selection
+requires both artifact roles to support this setting. The pinned compatibility
+execution artifact does not support it.
+
+`removed_bytes` counts allocated blocks of units the pass unlinks directly.
+It excludes hard-linked inodes that still have names outside the removed unit.
+`filesystem_space` groups collection scopes on the same filesystem and reports
+bytes available to the calling user before and after the pass, including any
+concurrent activity. Compare the snapshots to observe changes in available space
+from direct and native collection together. Provider, ownership and filesystem
+failures during collection remain errors. Scheduling and device paths belong to
+the operator's estate. This CLI adds no remote mutation command.
 Frozen release artifacts must be staged outside mutable caches.
 
 Run `just check` and `just provider-check` with the real `NDS_TEST_CLEANER` path.
