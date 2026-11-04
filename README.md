@@ -117,6 +117,7 @@ nds-cleaner-cache /operator/config/cache.json cargo test --locked
 nds-cleaner-cache /operator/config/cache.json uv sync --python 3.15.1
 nds-cleaner-cache /operator/config/cache.json bun install --frozen-lockfile
 nds-cleaner-cache /operator/config/cache.json clean
+nds-cleaner-cache /operator/config/cache.json clean --estimate
 nds-cleaner-cache /operator/config/cache.json clean --apply
 nds-cleaner-cache /operator/config/cache.json clean --apply --passes 32
 ```
@@ -147,7 +148,27 @@ receipt for the estate record and runs a first collection preview, and
 `--rollback RECEIPT` restores the previous selection without deleting anything.
 
 `clean` defaults to preview. JSON reports distinguish stale/removed native units,
-native GC calls, active leases and completed-use observations. `empty_units`
+native GC calls, active leases and completed-use observations.
+
+`clean --estimate` adds an advisory allocation report for Cargo units selected by
+the same dry-run guards. It identifies the unit kind, raw discovery key and
+available usage evidence. Target keys are `["0", hex(lane), "1", hex(target)]`.
+A lane build uses `"0"` in place of `"1"`, with fingerprint units adding
+hex-encoded path components under its build directory. A candidate's allocated bytes exclude inodes that
+retain a name outside that unit. The aggregate counts an inode once when all
+its names are included in the measured set. Open files can keep blocks
+allocated after unlinking. The existing volume snapshots show changes in free
+space and include concurrent activity. Native Cargo source, uv and Bun bytes
+are outside the estimate.
+
+Allocation uses a separate bounded traversal. The report includes at most 256
+candidate records, the examined entry count and whether the estimate is
+complete. Unmeasured units carry a reason, including budget and mount
+boundaries. Linux checks mount identity to detect same-device bind mounts.
+The normal apply traversal rechecks current ownership, leases and use records
+independently and keeps its own cursor.
+
+`empty_units`
 counts expired uv generations with no entries except an optional empty regular
 native `.lock`. These do not run another native GC and are not removed units or
 reclaimed bytes. Their directory, lock, lease and last-use ledger stay in place;
