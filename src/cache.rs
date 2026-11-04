@@ -9,6 +9,7 @@ use rustix::{fs::FlockOperation, io::FdFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     ffi::OsString,
     fs,
     io::{self, Read, Write},
@@ -1280,6 +1281,8 @@ pub struct Report {
     /// A hard-linked inode counts only if this removal unlinks all its names.
     pub removed_bytes: u64,
     pub filesystem_space: Vec<FilesystemSpace>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<Estimate>,
 }
 
 #[derive(Serialize)]
@@ -1359,6 +1362,7 @@ struct Scan {
     retention: Duration,
     after: Option<ScanKey>,
     position: Option<ScanKey>,
+    estimate: Option<EstimateScan>,
 }
 impl Scan {
     fn new(after: Option<ScanKey>) -> Self {
@@ -1367,6 +1371,7 @@ impl Scan {
             retention: RETENTION,
             position: after.clone(),
             after,
+            estimate: None,
         }
     }
     fn load(root: &Dir, apply: bool) -> Result<Self> {
@@ -1412,6 +1417,61 @@ impl Scan {
         end.push("g".into());
         self.note(&end);
     }
+    fn stale_cargo(
+        &mut self,
+        unit: Dir,
+        candidate: impl FnOnce() -> Candidate,
+        apply: bool,
+        report: &mut Report,
+    ) -> Result<()> {
+        report.stale_units += 1;
+        if apply {
+            return self.budget.effect(|| remove_unit(unit, report));
+        }
+        let Some(EstimateScan {
+            report: estimate,
+            budget,
+            allocation: total,
+            boundary,
+        }) = &mut self.estimate
+        else {
+            return Ok(());
+        };
+        estimate.candidate_units += 1;
+        if estimate.candidates.len() == 256 {
+            estimate.complete = false;
+            return Ok(());
+        }
+        let mut candidate = candidate();
+        let measured = self.budget.effect(|| {
+            budget.visit()?;
+            use cap_std::fs::MetadataExt;
+            let (device, mount) = boundary.ok_or(CacheError::Ownership)?;
+            if device != unit.dir_metadata()?.dev() {
+                return Err(CacheError::Ownership);
+            }
+            check_mount(mount, &unit, ".")?;
+            tree_allocation(&unit, mount, || budget.visit())
+        });
+        match measured {
+            Ok(allocation) => {
+                candidate.allocated_bytes = Some(allocation.unlinkable_bytes());
+                estimate.measured_units += 1;
+                total.merge(allocation);
+            }
+            Err(error) => {
+                estimate.complete = false;
+                candidate.unmeasured = Some(match error {
+                    CacheError::Budget => "budget",
+                    CacheError::Ownership => "mount_boundary",
+                    _ => "unavailable",
+                });
+            }
+        }
+        estimate.candidates.push(candidate);
+        Ok(())
+    }
+
     fn save(&self, root: &Dir) -> Result<()> {
         let Some(after) = &self.position else {
             return Ok(());
@@ -1502,46 +1562,175 @@ fn stamp(dir: &Dir) -> Result<Option<SystemTime>> {
     }
     Ok(newest)
 }
-/// Allocated bytes of inodes whose last names are in this unit. Use no-follow
-/// metadata and exclude file blocks still referenced by links outside the unit.
-fn tree_bytes(dir: &Dir) -> Result<u64> {
+struct EstimateScan {
+    report: Estimate,
+    budget: Budget,
+    allocation: Allocation,
+    // The configured cargo/lanes directory can itself be a bind mount.
+    boundary: Option<(u64, Option<u64>)>,
+}
+
+impl EstimateScan {
+    fn new(limit: usize) -> Self {
+        Self {
+            report: Estimate {
+                complete: true,
+                candidate_units: 0,
+                measured_units: 0,
+                entries_examined: 0,
+                allocated_bytes: 0,
+                candidates: Vec::new(),
+            },
+            budget: Budget {
+                limit,
+                ..Budget::new()
+            },
+            allocation: Allocation::default(),
+            boundary: None,
+        }
+    }
+
+    fn finish(mut self, scan_complete: bool) -> Estimate {
+        self.report.complete &= scan_complete;
+        self.report.entries_examined = self.budget.entries.min(self.budget.limit);
+        self.report.allocated_bytes = self.allocation.unlinkable_bytes();
+        self.report
+    }
+}
+
+#[derive(Serialize)]
+pub struct Estimate {
+    complete: bool,
+    candidate_units: usize,
+    measured_units: usize,
+    entries_examined: usize,
+    allocated_bytes: u64,
+    candidates: Vec<Candidate>,
+}
+
+#[derive(Serialize)]
+struct Candidate {
+    kind: &'static str,
+    // The discovery key preserves raw path bytes and is descriptive only.
+    key: ScanKey,
+    last_use_unix_seconds: Option<u64>,
+    allocated_bytes: Option<u64>,
+    unmeasured: Option<&'static str>,
+}
+
+impl Candidate {
+    fn new(kind: &'static str, key: &[String], last_use_unix_seconds: Option<u64>) -> Self {
+        Self {
+            kind,
+            key: key.to_vec(),
+            last_use_unix_seconds,
+            allocated_bytes: None,
+            unmeasured: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Allocation {
+    single_link_bytes: u64,
+    hard_links: HashMap<(u64, u64), (u64, u64, u64)>,
+}
+
+impl Allocation {
+    fn add_links(&mut self, key: (u64, u64), seen: u64, links: u64, bytes: u64) {
+        let entry = self.hard_links.entry(key).or_insert((0, links, bytes));
+        entry.0 += seen;
+        entry.1 = entry.1.max(links);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.single_link_bytes = self
+            .single_link_bytes
+            .saturating_add(other.single_link_bytes);
+        for (key, (seen, links, bytes)) in other.hard_links {
+            self.add_links(key, seen, links, bytes);
+        }
+    }
+
+    fn unlinkable_bytes(&self) -> u64 {
+        self.hard_links
+            .values()
+            .filter(|(seen, links, _)| seen == links)
+            .fold(self.single_link_bytes, |total, (_, _, bytes)| {
+                total.saturating_add(*bytes)
+            })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn mount_id(dir: &Dir, path: impl AsRef<Path>) -> Result<Option<u64>> {
+    use rustix::fs::{AtFlags, StatxFlags, statx};
+    let info = statx(
+        dir,
+        path.as_ref(),
+        AtFlags::SYMLINK_NOFOLLOW,
+        StatxFlags::MNT_ID,
+    )?;
+    if info.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
+        return Err(CacheError::Ownership);
+    }
+    Ok(Some(info.stx_mnt_id))
+}
+
+#[cfg(target_os = "macos")]
+fn mount_id(_dir: &Dir, _path: impl AsRef<Path>) -> Result<Option<u64>> {
+    Ok(None)
+}
+
+fn check_mount(expected: Option<u64>, dir: &Dir, path: impl AsRef<Path>) -> Result<()> {
+    if expected.is_some() && mount_id(dir, path)? != expected {
+        return Err(CacheError::Ownership);
+    }
+    Ok(())
+}
+
+/// No-follow allocation scan. Keep only a depth-first stack of open directories.
+fn tree_allocation(
+    dir: &Dir,
+    mount: Option<u64>,
+    mut visit: impl FnMut() -> Result<()>,
+) -> Result<Allocation> {
     use cap_std::fs::MetadataExt;
     let root = dir.dir_metadata()?;
-    let mut hard_links = std::collections::HashMap::new();
-    let mut pending = vec![dir.try_clone()?];
-    let mut total = root.blocks().saturating_mul(512);
-    while let Some(current) = pending.pop() {
-        for entry in current.entries()? {
-            let name = entry?.file_name();
-            let metadata = current.symlink_metadata(&name)?;
-            if metadata.dev() != root.dev() {
-                return Err(CacheError::Ownership);
-            }
-            let bytes = metadata.blocks().saturating_mul(512);
-            if metadata.is_dir() {
-                pending.push(directory(&current, Path::new(&name))?);
-            } else if metadata.nlink() > 1 {
-                let (seen, links, _) = hard_links
-                    .entry((metadata.dev(), metadata.ino()))
-                    .or_insert((0, metadata.nlink(), bytes));
-                *seen += 1;
-                *links = (*links).max(metadata.nlink());
-                continue;
-            }
-            total = total.saturating_add(bytes);
+    let mut allocation = Allocation {
+        single_link_bytes: root.blocks().saturating_mul(512),
+        ..Allocation::default()
+    };
+    let mut stack = vec![(dir.try_clone()?, dir.entries()?)];
+    while let Some((current, entries)) = stack.last_mut() {
+        let Some(entry) = entries.next() else {
+            stack.pop();
+            continue;
+        };
+        visit()?;
+        let name = entry?.file_name();
+        let metadata = current.symlink_metadata(&name)?;
+        if metadata.dev() != root.dev() {
+            return Err(CacheError::Ownership);
         }
-    }
-    for (seen, links, bytes) in hard_links.into_values() {
-        if seen == links {
-            total = total.saturating_add(bytes);
+        check_mount(mount, current, Path::new(&name))?;
+        let bytes = metadata.blocks().saturating_mul(512);
+        if metadata.is_dir() {
+            let child = directory(current, Path::new(&name))?;
+            let entries = child.entries()?;
+            stack.push((child, entries));
+        } else if metadata.nlink() > 1 {
+            allocation.add_links((metadata.dev(), metadata.ino()), 1, metadata.nlink(), bytes);
+            continue;
         }
+        allocation.single_link_bytes = allocation.single_link_bytes.saturating_add(bytes);
     }
-    Ok(total)
+    Ok(allocation)
 }
 
 /// Removes one collected unit and adds its measured bytes to the report.
 fn remove_unit(unit: Dir, report: &mut Report) -> Result<()> {
-    let bytes = tree_bytes(&unit)?;
+    let bytes = tree_allocation(&unit, None, || Ok(()))?.unlinkable_bytes();
     unit.remove_open_dir_all()?;
     report.removed_units += 1;
     report.removed_bytes = report.removed_bytes.saturating_add(bytes);
@@ -1590,11 +1779,12 @@ fn lane_build(
         return Ok(());
     };
     if lane_idle(lane, current, scan.retention, &mut scan.budget)? {
-        report.stale_units += 1;
-        if apply {
-            scan.budget.effect(|| remove_unit(build, report))?;
-        }
-        return Ok(());
+        return scan.stale_cargo(
+            build,
+            || Candidate::new("cargo_lane_build", prefix, None),
+            apply,
+            report,
+        );
     }
     artifact_units(&build, 0, current, apply, report, scan, prefix)
 }
@@ -1666,10 +1856,12 @@ fn artifact_units(
                             .map_err(|_| CacheError::Ownership)?
                             .as_secs();
                         if expired(seconds, current, scan.retention) {
-                            report.stale_units += 1;
-                            if apply {
-                                scan.budget.effect(|| remove_unit(unit_dir, report))?;
-                            }
+                            scan.stale_cargo(
+                                unit_dir,
+                                || Candidate::new("cargo_fingerprint", &unit_key, Some(seconds)),
+                                apply,
+                                report,
+                            )?;
                         }
                     } else {
                         report.unknown += 1;
@@ -1687,8 +1879,13 @@ fn artifact_units(
 }
 impl ManagedCache {
     pub fn collect(&self, apply: bool) -> Result<Report> {
-        self.collect_at(apply, now()?)
+        self.collect_at(apply, false, now()?)
     }
+
+    pub fn estimate(&self) -> Result<Report> {
+        self.collect_at(false, true, now()?)
+    }
+
     fn filesystem_space(&self) -> Vec<(u64, Dir, FilesystemSpace)> {
         let paths = [
             ("managed_root", self.root.try_clone().ok()),
@@ -1730,7 +1927,7 @@ impl ManagedCache {
         samples
     }
 
-    fn collect_at(&self, apply: bool, current: u64) -> Result<Report> {
+    fn collect_at(&self, apply: bool, estimate: bool, current: u64) -> Result<Report> {
         let _cleaner = lease(&self.root, true, false)?;
         self.version(&self.config.cargo, &qualified("cargo")?)?;
         let mut report = Report {
@@ -1743,6 +1940,9 @@ impl ManagedCache {
         let mut scan = Scan::load(&self.root, apply)?;
         scan.retention = self.config.retention();
         scan.budget.limit = self.config.scan_entries.unwrap_or(MAX_ENTRIES);
+        if estimate {
+            scan.estimate = Some(EstimateScan::new(scan.budget.limit));
+        }
         report.resumed = scan.after.is_some();
         let volumes = self.filesystem_space();
         match self.collect_pass(apply, current, &mut report, &mut scan) {
@@ -1760,6 +1960,9 @@ impl ManagedCache {
             }
             Err(error) => return Err(error),
         }
+        report.estimate = scan
+            .estimate
+            .map(|estimate| estimate.finish(report.scan_complete));
         report.filesystem_space = volumes
             .into_iter()
             .map(|(_, dir, mut sample)| {
@@ -1777,6 +1980,12 @@ impl ManagedCache {
         scan: &mut Scan,
     ) -> Result<()> {
         let lanes = directory(&self.root, Path::new("cargo/lanes"))?;
+        if let Some(estimate) = &mut scan.estimate {
+            use cap_std::fs::MetadataExt;
+            if let (Ok(meta), Ok(mount)) = (lanes.dir_metadata(), mount_id(&lanes, ".")) {
+                estimate.boundary = Some((meta.dev(), mount));
+            }
+        }
         let mut cargo_busy = false;
         for entry in sorted_entries(&lanes)? {
             scan.budget.visit()?;
@@ -1840,10 +2049,12 @@ impl ManagedCache {
                     }
                     match last_use(&target) {
                         Ok(last) if expired(last, current, scan.retention) => {
-                            report.stale_units += 1;
-                            if apply {
-                                scan.budget.effect(|| remove_unit(target, report))?;
-                            }
+                            scan.stale_cargo(
+                                target,
+                                || Candidate::new("cargo_target", &target_key, Some(last)),
+                                apply,
+                                report,
+                            )?;
                         }
                         Ok(_) => {}
                         Err(_) => report.unknown += 1,

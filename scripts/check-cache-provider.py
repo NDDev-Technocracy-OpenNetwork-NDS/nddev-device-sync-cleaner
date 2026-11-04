@@ -470,6 +470,95 @@ def qualify_retention_policy(base, config, binary, environment):
             "bun_collection": "qualified" if sys.platform == "linux" else "deferred"}
 
 
+def qualify_cargo_estimate(base, config, binary, environment):
+    """Compare bounded forecasting and collection in an owned cache."""
+    root, path = base / "estimate-cache", base / "estimate-profile.json"
+    settings = dict(json.loads(config.read_text()), root=str(root), frontends=None,
+                    cargo_home=None, retention_seconds=86400)
+    path.write_text(json.dumps(settings))
+
+    def run(*args):
+        start = time.monotonic()
+        raw = call([binary, path, *args], cwd=base, environment=environment)
+        return json.loads(raw), round((time.monotonic() - start) * 1000, 2)
+
+    run("init")
+    now = int(time.time())
+    old = now - 86430
+
+    def target(lane, label, last):
+        lane_dir = root / "cargo/lanes" / (lane * 64)
+        directory = lane_dir / "targets" / (label * 64)
+        directory.mkdir(parents=True)
+        (lane_dir / ".lease").touch()
+        (directory / ".last-use").write_text(str(last))
+        return directory
+
+    first, second = target("a", "1", old), target("a", "2", old)
+    replacement = target("a", "3", old)
+    fresh = target("a", "4", now)
+    busy = target("b", "1", old)
+    pending = target("a", "5", old)
+    (pending / ".pending-use").write_text("1")
+    outside = base / "estimate-pinned"
+    outside.write_bytes(b"p" * 64 * 1024)
+    os.link(outside, first / "external-link")
+    shared = first / "cross-candidate-link"
+    shared.write_bytes(b"s" * 128 * 1024)
+    os.link(shared, second / "same-inode")
+    open_file = first / "open-payload"
+    open_file.write_bytes(b"o" * 64 * 1024)
+    for index in range(64):
+        (second / f"entry-{index}").write_bytes(b"x" * 4096)
+
+    with (busy.parents[1] / ".lease").open("r+b") as lock, open_file.open("rb") as opened:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        ordinary, ordinary_ms = run("clean")
+        preview, preview_ms = run("clean", "--estimate")
+        estimate = preview["estimate"]
+        assert ordinary["stale_units"] == preview["stale_units"] == 3
+        assert "estimate" not in ordinary and preview["busy"] == 1 and preview["completed_uses"] == 1
+        assert preview["dry_run"] and preview["removed_units"] == 0 and estimate["complete"]
+        assert estimate["candidate_units"] == estimate["measured_units"] == 3
+        assert all(candidate["kind"] == "cargo_target" and candidate["last_use_unix_seconds"] == old
+                   for candidate in estimate["candidates"])
+        assert estimate["allocated_bytes"] - sum(candidate["allocated_bytes"] for candidate in estimate["candidates"]) == shared.stat().st_blocks * 512
+        assert outside.stat().st_nlink == 2 and replacement.is_dir()
+
+        path.write_text(json.dumps(dict(settings, scan_entries=32)))
+        partial, partial_ms = run("clean", "--estimate")
+        assert partial["scan_complete"] and not partial["estimate"]["complete"]
+        assert partial["estimate"]["entries_examined"] == 32
+        assert partial["estimate"]["candidate_units"] == 3
+        assert any(candidate["unmeasured"] == "budget" for candidate in partial["estimate"]["candidates"])
+        assert not (root / ".gc-progress").exists()
+        path.write_text(json.dumps(settings))
+
+        replacement.rename(base / "pre-estimate-identity")
+        replacement.mkdir()
+        (replacement / ".last-use").write_text(str(now))
+        before, _ = run("clean", "--estimate")
+        applied, apply_ms = run("clean", "--apply", "--passes", "4")
+        actual = applied["passes"][-1]
+        assert before["estimate"]["measured_units"] == actual["removed_units"] == 2
+        assert before["estimate"]["allocated_bytes"] == actual["removed_bytes"]
+        assert not first.exists() and not second.exists()
+        assert all(item.is_dir() for item in (fresh, busy, pending, replacement))
+        assert outside.read_bytes() == b"p" * 64 * 1024 and outside.stat().st_nlink == 1
+        stat = os.fstat(opened.fileno())
+        assert stat.st_nlink == 0 and stat.st_blocks > 0 and opened.read(1) == b"o"
+        repeat, _ = run("clean", "--apply")
+        assert repeat["removed_units"] == 0
+
+    return {"ordinary_preview_ms": ordinary_ms, "measured_preview_ms": preview_ms,
+            "budgeted_preview_ms": partial_ms, "apply_ms": apply_ms,
+            "measured_entries": before["estimate"]["entries_examined"],
+            "budgeted_entries": partial["estimate"]["entries_examined"],
+            "estimated_allocated_bytes": before["estimate"]["allocated_bytes"],
+            "reported_unlinked_bytes": actual["removed_bytes"],
+            "open_unlinked_blocks_remain": True, "replacement_and_active_units_preserved": True}
+
+
 def qualify_bun_descendants(base, config, binary, environment, consumer_binary=None):
     """Real Bun closes inherited fds; the owned subreaper must still guard them."""
     if sys.platform != "linux":
@@ -1280,13 +1369,15 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
         assert call([python / ".venv/bin/python", "-c", "import idna,sys;print(sys.version_info[:3])"]).strip() == "(3, 15, 1)"
         assert call([tools / "bun", "-e", 'console.log(require("is-number")(7))'], cwd=javascript).strip() == "true"
         configured_retention = qualify_retention_policy(base, config, binary, fixture_env)
+        cargo_estimate = qualify_cargo_estimate(base, config, binary, fixture_env)
         descendants = qualify_bun_descendants(base, config, binary, fixture_env)
         placement = qualify_uv_placement(base, config, binary, fixture_env)
         native_locks = qualify_native_owner_locks(base, config, binary, fixture_env)
         return {"bun_descendant_lifetime": descendants,
                 "native_owner_locks": native_locks,
                 "uv_environment_placement": placement,
-                "configured_retention": configured_retention, "bounded_collection": bounded_passes,
+                "configured_retention": configured_retention, "cargo_estimate": cargo_estimate,
+                "bounded_collection": bounded_passes,
                 "external_subcommands": externals, "online_offline_tool_reuse": tool_reuse,
                 "cargo_output_boundary": output_boundary, "legacy_opt_in_cross_project_warm_hit": True,
                 "rustup_cargo_routing": bool(rustup), "separate_final_binaries": True,
