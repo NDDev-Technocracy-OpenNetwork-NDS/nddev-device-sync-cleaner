@@ -181,7 +181,11 @@ progress is never substituted for a completed traversal. Scheduling and device p
 adds no remote mutation command.
 Frozen release artifacts must be staged outside mutable caches.
 
-Run `just check` and `just provider-check` with the real `NDS_TEST_CLEANER` path.
+Run `just check` for build-free Just/Rust formatting. On the native executor,
+`just test` runs the retained Python cases, workspace/all-target Clippy and
+workspace tests; `just verify` adds the existing policy, advisory and release
+build gates. The workspace scopes cover the former root-only invocations once.
+Use `just provider-check` with the real `NDS_TEST_CLEANER` path for provider acceptance.
 The legacy provider acceptance uses isolated state. `just cache-provider-check
 BINARY TOOLS RUSTC RUSTDOC` exercises real cross-project Cargo reuse, native
 use timestamps, stale artifact/source GC, native child leases, and uv/Bun cleanup
