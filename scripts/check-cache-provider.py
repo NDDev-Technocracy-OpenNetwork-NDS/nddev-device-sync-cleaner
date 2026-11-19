@@ -841,8 +841,21 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
             "busy_preview_preserves_records": True, "next_complete_pass_succeeds": True}
 
 
-def qualify_output_boundary(run, base, root, binary, config, environment):
+def qualify_output_boundary(base, root, binary, config, environment):
     """Real concurrent compilers, transitive rustdoc, warm reuse and native leases."""
+    workspace_config = base / "workspace-lanes.json"
+    frontends = base / "workspace-frontends"
+    retention = 86400
+    workspace_config.write_text(json.dumps(dict(json.loads(config.read_text()),
+                                                frontends=str(frontends), retention_seconds=retention,
+                                                cargo_workspace_lanes=True)))
+    call([sys.executable, REPO / "scripts/install-cache-frontends.py", workspace_config, binary])
+    cargo = frontends / "cargo"
+
+    def run(operation, *args, cwd=base, overrides=None):
+        command = [cargo] if operation == "cargo" else [binary, workspace_config, operation]
+        return call([*command, *args], cwd=cwd, environment=dict(environment, **(overrides or {})))
+
     work = base / "output-boundary"
     leaf, middle = work / "leaf", work / "middle"
     for path, dependencies, body in (
@@ -881,15 +894,19 @@ def qualify_output_boundary(run, base, root, binary, config, environment):
         apps.append(app)
     builds = [Path(item["build_directory"]) for item in metadata]
     targets = [Path(item["target_directory"]) for item in metadata]
-    assert builds == targets and builds[0] != builds[1]
+    assert builds == targets and builds[0].parents[2] != builds[1].parents[2]
     assert all(path.is_relative_to(root / "cargo/lanes") for path in builds)
+    opaque = [json.loads(run("cargo", "--config", "build.jobs=1", "metadata", "--locked", "--offline",
+                             "--no-deps", "--format-version", "1", cwd=app)) for app in apps]
+    opaque_lanes = [Path(item["build_directory"]).parents[2] for item in opaque]
+    assert opaque_lanes[0] == opaque_lanes[1] and opaque_lanes[0] not in [p.parents[2] for p in builds]
     children, logs = [], []
     try:
         for app in apps:
             log = tempfile.TemporaryFile(mode="w+")
             logs.append(log)
             children.append(subprocess.Popen(
-                [str(binary), str(config), "cargo", "build", "--locked", "--offline", "--message-format=json"],
+                [str(cargo), "build", "--locked", "--offline", "--message-format=json"],
                 cwd=app, env=environment, stdout=log, stderr=log, start_new_session=True))
         deadline = time.monotonic() + 15
         while not all((app / "ready").exists() for app in apps):
@@ -958,7 +975,7 @@ def qualify_output_boundary(run, base, root, binary, config, environment):
         unknown.parent.mkdir(parents=True)
         unknown.write_bytes(b"unqualified layout stays owned")
         run("clean", "--apply")  # Native completion acknowledges pending uses.
-        old = int(time.time()) - RETENTION - 10
+        old = int(time.time()) - retention - 10
         (builds[0].parent / ".last-use").write_text(str(old))
         leaf_stamp = next(legacy.glob("debug/build/leaf/*/fingerprint/lib-leaf"))
         os.utime(leaf_stamp, (old, old))
@@ -971,6 +988,32 @@ def qualify_output_boundary(run, base, root, binary, config, environment):
         assert collected["removed_units"] >= 2 and not leaf_stamp.exists() and not builds[0].exists()
         assert shared_stamp.exists() and unknown.read_bytes() == b"unqualified layout stays owned"
         assert all(hashlib.sha256(Path(path).read_bytes()).hexdigest() == value for path, value in current.items())
+
+        # The collected A workspace has to rebuild. Keep its real build script
+        # running while B expires, proving that B can be collected independently.
+        (apps[0] / "ready").unlink()
+        (apps[0] / "release").unlink()
+        child = subprocess.Popen(
+            [str(cargo), "build", "--locked", "--offline"],
+            cwd=apps[0], env=environment, stdout=logs[0], stderr=logs[0], start_new_session=True)
+        children.append(child)
+        deadline = time.monotonic() + 15
+        while not (apps[0] / "ready").exists():
+            assert child.poll() is None and time.monotonic() < deadline, "workspace A did not reach its build gate"
+            time.sleep(0.02)
+        (builds[1].parent / ".last-use").write_text(str(old))
+        before = json.loads(run("clean"))
+        assert before["retention_seconds"] == retention
+        assert before["busy"] >= 1 and before["stale_units"] >= 1 and builds[1].is_dir()
+        applied = json.loads(run("clean", "--apply"))
+        assert applied["busy"] >= 1 and applied["removed_units"] >= 1 and applied["removed_bytes"] > 0
+        assert builds[0].is_dir() and not builds[1].exists() and child.poll() is None
+        space = next(entry for entry in applied["filesystem_space"] if "cargo_lanes" in entry["scopes"])
+        assert space["available_bytes_before"] > 0 and space["available_bytes_after"] > 0
+        assert json.loads(run("clean", "--apply"))["removed_units"] == 0
+        (apps[0] / "release").touch()
+        assert child.wait(timeout=15) == 0
+        assert json.loads(run("clean", "--apply"))["completed_uses"] >= 1
     finally:
         for app in apps:
             (app / "release").touch()
@@ -982,6 +1025,7 @@ def qualify_output_boundary(run, base, root, binary, config, environment):
             log.close()
     return {"independent_workspaces_progress_concurrently": True,
             "native_busy_lease_and_completed_use": True, "transitive_doctest": True,
+            "independent_idle_workspace_collection": True, "opaque_config_retains_compiler_lane": True,
             "same_workspace_warm_hit": True, "cross_workspace_compiled_hit": False,
             "shared_source_home": True, "original_locks_and_checkout_placement_preserved": True,
             "legacy_opt_in_reuse_and_unit_gc": True,
@@ -1030,8 +1074,8 @@ def qualify(binary, tools, rustc, rustdoc, *, caller_targets_only=False, tool_co
         if native_locks_only:
             return qualify_native_owner_locks(base, config, binary, fixture_env)
         if output_boundary_only:
-            return qualify_output_boundary(run, base, root, binary, config, fixture_env)
-        output_boundary = qualify_output_boundary(run, base, root, binary, config, fixture_env)
+            return qualify_output_boundary(base, root, binary, config, fixture_env)
+        output_boundary = qualify_output_boundary(base, root, binary, config, fixture_env)
         externals = qualify_externals(run, base, root, environment=fixture_env)
         packages = tomllib.loads((REPO / "Cargo.lock").read_text())["package"]
         pins = {name: next(item["version"] for item in packages if item["name"] == name)
