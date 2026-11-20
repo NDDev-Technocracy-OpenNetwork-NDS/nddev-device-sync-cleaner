@@ -20,5 +20,5 @@ jobs:
       python-version: 3.15.2
       rust-version: 1.100.0
       rust-components: clippy,rustfmt
-      tools: cargo-deny@0.20.2
+      tools: cargo-deny@0.21.0
       tool-assets: .github/ci-tools.json
