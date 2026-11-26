@@ -4,6 +4,11 @@ fn main() {
         println!("nds-cleaner-cache {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if args.len() == 2 && args[1] == "--supports-cargo-workspace-lanes" {
+        println!("cargo_workspace_lanes");
+        return;
+    }
     run();
 }
 // Local operator entry point; no remote command or agent capability is added.

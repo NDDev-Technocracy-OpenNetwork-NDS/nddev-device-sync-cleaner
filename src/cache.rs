@@ -85,6 +85,8 @@ pub struct Config {
     pub scan_entries: Option<usize>,
     pub retention_seconds: Option<u64>,
     pub environment_root: Option<PathBuf>,
+    #[serde(default)]
+    pub cargo_workspace_lanes: bool,
 }
 
 impl Config {
@@ -864,7 +866,7 @@ impl ManagedCache {
             .take_while(|s| s.as_os_str() != "--")
             .any(|s| s == "clean")
         {
-            return Err(CacheError::Configuration);
+            return Err(CacheError::ManagedCacheCommand);
         }
         self.version(&self.config.cargo, &qualified("cargo")?)?;
         let cwd = fs::canonicalize(std::env::current_dir()?)?;
@@ -933,10 +935,6 @@ impl ManagedCache {
         }
         let mut identity = version;
         identity.extend(rustc.as_os_str().as_encoded_bytes());
-        let lane_name = digest(&identity);
-        let lane_path = Path::new("cargo/lanes").join(&lane_name);
-        let lane = prepare(&self.root, &lane_path)?;
-        let _lease = lease(&lane, false, true)?;
         let inherited_build = std::env::var_os("CARGO_BUILD_BUILD_DIR");
         let special_target = std::env::var_os("CARGO_TARGET_DIR");
         let inherited_target = special_target
@@ -1007,6 +1005,17 @@ impl ManagedCache {
         }
         workspace_identity.push(depth);
         let workspace = digest(&workspace_identity);
+        if self.config.cargo_workspace_lanes && !has_cli_config {
+            // Default outputs already belong to one workspace. Scope their lifetime
+            // lease the same way, in a separate lane so older frontends and collectors
+            // can continue honoring legacy leases without a protocol transition.
+            // Opaque CLI configuration retains the existing compiler lane.
+            identity.extend_from_slice(b"\0cargo-workspace-lane-v1\0");
+            identity.extend_from_slice(workspace.as_bytes());
+        }
+        let lane_path = Path::new("cargo/lanes").join(digest(&identity));
+        let lane = prepare(&self.root, &lane_path)?;
+        let _lease = lease(&lane, false, true)?;
         let target_path = lane_path.join("targets").join(&workspace);
         directory(&self.root, Path::new("cargo/home"))?;
         let root = &self.config.root;
@@ -1267,9 +1276,22 @@ pub struct Report {
     pub completed_uses: usize,
     pub scan_complete: bool,
     pub resumed: bool,
-    /// Allocated bytes of the units this pass removed itself, measured before unlinking; hard
-    /// links count once. Native provider GC (Cargo source, uv, Bun) reports its own effects.
+    /// Allocated bytes of the units this pass removed itself, measured before unlinking.
+    /// A hard-linked inode counts only if this removal unlinks all its names.
     pub removed_bytes: u64,
+    pub filesystem_space: Vec<FilesystemSpace>,
+}
+
+#[derive(Serialize)]
+pub struct FilesystemSpace {
+    pub scopes: Vec<&'static str>,
+    pub available_bytes_before: u64,
+    pub available_bytes_after: Option<u64>,
+}
+
+fn available_bytes(dir: &Dir) -> Option<u64> {
+    let stats = rustix::fs::fstatvfs(dir).ok()?;
+    stats.f_bavail.checked_mul(stats.f_frsize)
 }
 struct Budget {
     entries: usize,
@@ -1480,32 +1502,38 @@ fn stamp(dir: &Dir) -> Result<Option<SystemTime>> {
     }
     Ok(newest)
 }
-/// Allocated bytes under `dir`, without following symlinks; each multiply-linked inode counts once.
+/// Allocated bytes of inodes whose last names are in this unit. Use no-follow
+/// metadata and exclude file blocks still referenced by links outside the unit.
 fn tree_bytes(dir: &Dir) -> Result<u64> {
-    #[cfg(unix)]
     use cap_std::fs::MetadataExt;
-    let mut seen = std::collections::HashSet::new();
+    let root = dir.dir_metadata()?;
+    let mut hard_links = std::collections::HashMap::new();
     let mut pending = vec![dir.try_clone()?];
-    let mut total = 0u64;
+    let mut total = root.blocks().saturating_mul(512);
     while let Some(current) = pending.pop() {
         for entry in current.entries()? {
-            let entry = entry?;
-            let metadata = entry.metadata()?;
-            #[cfg(unix)]
-            let bytes = if metadata.nlink() > 1 && !seen.insert((metadata.dev(), metadata.ino())) {
-                0
-            } else {
-                metadata.blocks().saturating_mul(512)
-            };
-            #[cfg(not(unix))]
-            let bytes = {
-                let _ = &mut seen;
-                metadata.len()
-            };
-            total = total.saturating_add(bytes);
-            if metadata.is_dir() {
-                pending.push(directory(&current, Path::new(&entry.file_name()))?);
+            let name = entry?.file_name();
+            let metadata = current.symlink_metadata(&name)?;
+            if metadata.dev() != root.dev() {
+                return Err(CacheError::Ownership);
             }
+            let bytes = metadata.blocks().saturating_mul(512);
+            if metadata.is_dir() {
+                pending.push(directory(&current, Path::new(&name))?);
+            } else if metadata.nlink() > 1 {
+                let (seen, links, _) = hard_links
+                    .entry((metadata.dev(), metadata.ino()))
+                    .or_insert((0, metadata.nlink(), bytes));
+                *seen += 1;
+                *links = (*links).max(metadata.nlink());
+                continue;
+            }
+            total = total.saturating_add(bytes);
+        }
+    }
+    for (seen, links, bytes) in hard_links.into_values() {
+        if seen == links {
+            total = total.saturating_add(bytes);
         }
     }
     Ok(total)
@@ -1661,6 +1689,47 @@ impl ManagedCache {
     pub fn collect(&self, apply: bool) -> Result<Report> {
         self.collect_at(apply, now()?)
     }
+    fn filesystem_space(&self) -> Vec<(u64, Dir, FilesystemSpace)> {
+        let paths = [
+            ("managed_root", self.root.try_clone().ok()),
+            (
+                "cargo_lanes",
+                directory(&self.root, Path::new("cargo/lanes")).ok(),
+            ),
+            (
+                "cargo_home",
+                self.cargo_home()
+                    .ok()
+                    .and_then(|path| Dir::open_ambient_dir(path, ambient_authority()).ok()),
+            ),
+            ("uv", directory(&self.root, Path::new("uv")).ok()),
+            ("bun", directory(&self.root, Path::new("bun")).ok()),
+        ];
+        let mut samples: Vec<(u64, Dir, FilesystemSpace)> = Vec::new();
+        for (scope, dir) in paths {
+            let Some(dir) = dir else { continue };
+            let Ok(metadata) = dir.dir_metadata() else {
+                continue;
+            };
+            use cap_std::fs::MetadataExt;
+            let device = metadata.dev();
+            if let Some((_, _, sample)) = samples.iter_mut().find(|(dev, _, _)| *dev == device) {
+                sample.scopes.push(scope);
+            } else if let Some(before) = available_bytes(&dir) {
+                samples.push((
+                    device,
+                    dir,
+                    FilesystemSpace {
+                        scopes: vec![scope],
+                        available_bytes_before: before,
+                        available_bytes_after: None,
+                    },
+                ));
+            }
+        }
+        samples
+    }
+
     fn collect_at(&self, apply: bool, current: u64) -> Result<Report> {
         let _cleaner = lease(&self.root, true, false)?;
         self.version(&self.config.cargo, &qualified("cargo")?)?;
@@ -1675,6 +1744,7 @@ impl ManagedCache {
         scan.retention = self.config.retention();
         scan.budget.limit = self.config.scan_entries.unwrap_or(MAX_ENTRIES);
         report.resumed = scan.after.is_some();
+        let volumes = self.filesystem_space();
         match self.collect_pass(apply, current, &mut report, &mut scan) {
             Ok(()) => {
                 if apply {
@@ -1690,6 +1760,13 @@ impl ManagedCache {
             }
             Err(error) => return Err(error),
         }
+        report.filesystem_space = volumes
+            .into_iter()
+            .map(|(_, dir, mut sample)| {
+                sample.available_bytes_after = available_bytes(&dir);
+                sample
+            })
+            .collect();
         Ok(report)
     }
     fn collect_pass(
@@ -1978,6 +2055,7 @@ mod tests {
                 scan_entries: None,
                 retention_seconds: None,
                 environment_root: None,
+                cargo_workspace_lanes: false,
             },
         )
     }
@@ -2031,6 +2109,10 @@ mod tests {
             assert!(matches!(error, CacheError::ManagedCacheCommand));
             assert!(error.to_string().contains("nds-cleaner-cache CONFIG clean"));
         }
+        assert!(matches!(
+            cache.run_cargo(&["clean".into(), "--help".into()]),
+            Err(CacheError::ManagedCacheCommand)
+        ));
         // Arguments after `--` belong to the called program, not to the frontend.
         let passthrough: Vec<OsString> =
             ["run", "--", "cache"].into_iter().map(Into::into).collect();
@@ -2440,6 +2522,29 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn removed_bytes_exclude_inodes_linked_outside_the_unit() {
+        let temp = tempfile::tempdir().unwrap();
+        let unit = temp.path().join("unit");
+        fs::create_dir(&unit).unwrap();
+        let kept = temp.path().join("kept");
+        fs::write(&kept, vec![1; 64 * 1024]).unwrap();
+        fs::hard_link(&kept, unit.join("external-hard-link")).unwrap();
+        symlink(&kept, unit.join("symlink")).unwrap();
+        let payload = unit.join("payload");
+        fs::write(&payload, vec![2; 64 * 1024]).unwrap();
+        fs::hard_link(&payload, unit.join("internal-hard-link")).unwrap();
+        let allocated = |path: &Path| fs::symlink_metadata(path).unwrap().blocks() * 512;
+        let expected = allocated(&unit) + allocated(&payload) + allocated(&unit.join("symlink"));
+
+        let dir = Dir::open_ambient_dir(&unit, ambient_authority()).unwrap();
+        let mut report = Report::default();
+        remove_unit(dir, &mut report).unwrap();
+        assert_eq!((report.removed_units, report.removed_bytes), (1, expected));
+        assert_eq!(fs::read(kept).unwrap(), vec![1; 64 * 1024]);
+        assert!(!unit.exists());
+    }
+
     #[test]
     fn an_idle_lane_build_directory_is_collected_whole_and_measured() {
         let temp = tempfile::tempdir().unwrap();

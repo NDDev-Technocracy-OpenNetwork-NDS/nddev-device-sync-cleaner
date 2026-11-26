@@ -264,6 +264,15 @@ def plan(args, run):
     base = json.loads(base_path.read_text())
     if base.get("schema") != 1 or not Path(base["root"]).is_absolute():
         raise ValueError("base profile is not a schema-1 managed profile")
+    workspace_lanes = base.pop("cargo_workspace_lanes", False)
+    if not isinstance(workspace_lanes, bool):
+        raise ValueError("cargo_workspace_lanes must be a boolean")
+    if workspace_lanes:
+        base["cargo_workspace_lanes"] = True
+        for role, data in roles.items():
+            capability = run([str(data["binary"]), "--supports-cargo-workspace-lanes"], check=False)
+            if capability.returncode != 0 or capability.stdout.strip() != "cargo_workspace_lanes":
+                raise ValueError(f"{role} binary does not support cargo_workspace_lanes")
     if not 86400 <= args.retention <= 31536000 or args.retention % 86400:
         raise ValueError("retention must be whole days from 86400 through 31536000 seconds")
     profile_id = f"{roles['execution']['source'][:12]}-{roles['maintenance']['source'][:12]}-r{args.retention}"
